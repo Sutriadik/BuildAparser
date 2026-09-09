@@ -7,7 +7,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.extractors.grounding_linker import (
+from app.services.grounding_linker import (
     find_best_bounding_box,
     link_visual_groundings,
     _tokenize,

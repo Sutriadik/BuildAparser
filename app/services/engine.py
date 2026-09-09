@@ -13,12 +13,12 @@ from app.logger import logger
 from app.schemas.common import LandingAIParsedResponse
 from app.schemas.contract import ContractExtractionSchema
 from app.schemas.sph import SPHExtractionSchema
-from app.parsers.router import is_scanned_pdf
+from app.parsers.utils import is_scanned_pdf
 from app.parsers.docling_parser import DoclingParser
 from app.parsers.paddle_parser import PaddleOCRParser
 from app.extractors.ollama_client import OllamaExtractor
-from app.extractors.classifier import DocumentClassifier
-from app.extractors.grounding_linker import link_visual_groundings
+from app.services.classifier import DocumentClassifier
+from app.services.grounding_linker import link_visual_groundings
 
 
 class ParsingError(Exception):
