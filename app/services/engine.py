@@ -42,10 +42,20 @@ class OpenADEEngine:
         self.classifier = DocumentClassifier()
         self.extractor = OllamaExtractor()
 
-    def parse(self, pdf_path: str, max_pages: int = None) -> LandingAIParsedResponse:
+    def parse(
+        self, 
+        pdf_path: str, 
+        max_pages: int = None,
+        parser: str = "auto"
+    ) -> LandingAIParsedResponse:
         """
         Stage 1: Parse Document
         Mendeteksi layout, tabel, teks, dan visual grounding bounding box.
+        
+        Args:
+            pdf_path: Path ke file PDF.
+            max_pages: Maksimal halaman yang diproses.
+            parser: 'auto' (Docling dengan fallback PaddleOCR), 'docling' (IBM Docling), atau 'paddle' (PaddleOCR).
         """
         pdf_path_obj = Path(pdf_path)
         if not pdf_path_obj.exists():
@@ -59,23 +69,41 @@ class OpenADEEngine:
             raise ParsingError(f"Gagal mendeteksi tipe PDF: {e}")
         
         parse_start = time.time()
+        parser_choice = parser.lower()
         
-        if scanned:
-            logger.info("🔍 Mode: [SCANNED / IMAGE-BASED PDF] → PaddleOCR Engine")
-            try:
-                parsed_res = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
-            except Exception as e:
-                raise ParsingError(f"PaddleOCR parsing gagal: {e}")
-        else:
-            logger.info("🔍 Mode: [DIGITAL NATIVE PDF] → IBM Docling Engine")
+        if parser_choice == "docling":
+            logger.info("🔍 Parser Dipilih: [IBM Docling] (Layout, OCR & Table Structure Aktif)")
             try:
                 parsed_res = self.docling_parser.parse(pdf_path)
             except Exception as e:
-                raise ParsingError(f"Docling parsing gagal: {e}")
+                logger.warning(f"⚠️ Docling parsing gagal ({e}), fallback ke PaddleOCR...")
+                parsed_res = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
+        elif parser_choice == "paddle":
+            logger.info("🔍 Parser Dipilih: [PaddleOCR] (Spatial Line Clustering)")
+            parsed_res = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
+        else: # auto
+            if scanned:
+                logger.info("🔍 Mode: [SCANNED / IMAGE-BASED PDF] → IBM Docling (OCR Enabled) + PaddleOCR Fallback")
+                try:
+                    # Coba Docling dengan OCR Pipeline
+                    parsed_res = self.docling_parser.parse(pdf_path)
+                    # Jika Docling menghasilkan output yang terlalu sedikit pada scan, gunakan PaddleOCR
+                    if parsed_res.metadata.output_markdown_chars < 50:
+                        logger.info("ℹ️ Menggunakan PaddleOCR untuk optimasi teks scan berstempel...")
+                        parsed_res = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
+                except Exception as e:
+                    logger.warning(f"⚠️ Docling scan parsing ({e}), beralih ke PaddleOCR...")
+                    parsed_res = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
+            else:
+                logger.info("🔍 Mode: [DIGITAL NATIVE PDF] → IBM Docling Engine")
+                try:
+                    parsed_res = self.docling_parser.parse(pdf_path)
+                except Exception as e:
+                    raise ParsingError(f"Docling parsing gagal: {e}")
         
         parse_duration = time.time() - parse_start
         logger.info(
-            f"✅ Parsing selesai: {parsed_res.metadata.page_count} halaman | "
+            f"✅ Parsing selesai [{parsed_res.metadata.parser_engine}]: {parsed_res.metadata.page_count} halaman | "
             f"{parsed_res.metadata.output_markdown_chars} karakter | {parse_duration:.1f}s"
         )
         return parsed_res
@@ -188,7 +216,8 @@ class OpenADEEngine:
         pdf_path: str, 
         doc_type: str = "auto", 
         output_dir: str = None,
-        max_pages: int = None
+        max_pages: int = None,
+        parser: str = "auto"
     ) -> Dict[str, Any]:
         """
         End-to-End Pipeline: Parse + Auto-Classify + Extract + Visual Grounding Linker
@@ -203,8 +232,8 @@ class OpenADEEngine:
         parsing_dir.mkdir(parents=True, exist_ok=True)
         extraction_dir.mkdir(parents=True, exist_ok=True)
         
-        # 1. Parse Stage
-        parsed_res = self.parse(pdf_path, max_pages=max_pages)
+        # 1. Parse Stage (Docling / Paddle / Auto)
+        parsed_res = self.parse(pdf_path, max_pages=max_pages, parser=parser)
         
         parse_md_file = parsing_dir / f"{base_name}.parse.md"
         parse_json_file = parsing_dir / f"{base_name}.parse.json"
