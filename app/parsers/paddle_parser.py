@@ -1,7 +1,18 @@
+"""
+Open ADE — PaddleOCR Parser (v2: Layout-Aware)
+
+Dua mode:
+1. LAYOUT MODE (default): Menggunakan PP-Structure untuk deteksi region layout
+   (text, table, title, figure) + SLANet table recognition → markdown terstruktur.
+2. FALLBACK MODE: Jika PPStructure tidak tersedia, gunakan PaddleOCR + spatial
+   clustering (mode lama).
+
+Kedua mode menghasilkan output yang sama: LandingAIParsedResponse.
+"""
 import time
 import fitz
 import re
-from typing import List, Tuple
+from typing import List, Optional
 from dataclasses import dataclass
 from paddleocr import PaddleOCR
 from app.config import config
@@ -18,6 +29,11 @@ from app.schemas.common import (
     AtomicGrounding
 )
 
+
+# ============================================================================
+# OCR Box and Spatial Clustering (Fallback mode)
+# ============================================================================
+
 @dataclass
 class OCRBox:
     text: str
@@ -28,10 +44,15 @@ class OCRBox:
     center_y: float
     confidence: float
 
-def cluster_and_merge_lines(boxes: List[OCRBox], y_tolerance: float = None, x_gap_tolerance: float = None) -> List[OCRBox]:
+
+def cluster_and_merge_lines(
+    boxes: List[OCRBox], 
+    y_tolerance: float = None, 
+    x_gap_tolerance: float = None
+) -> List[OCRBox]:
     """
-    Mengelompokkan dan menggabungkan potongan teks OCR yang berada pada baris horizontal yang sama (Spatial Reading Order).
-    Menghasilkan kalimat utuh (misal: 'Nama :' + 'Mohamad Veni' -> 'Nama : Mohamad Veni').
+    Mengelompokkan dan menggabungkan potongan teks OCR yang berada pada baris
+    horizontal yang sama (Spatial Reading Order).
     """
     if y_tolerance is None:
         y_tolerance = config.OCR_Y_TOLERANCE
@@ -41,27 +62,23 @@ def cluster_and_merge_lines(boxes: List[OCRBox], y_tolerance: float = None, x_ga
     if not boxes:
         return []
         
-    # Sort boxes primarily by ymin, then xmin
     sorted_boxes = sorted(boxes, key=lambda b: (round(b.ymin / y_tolerance) * y_tolerance, b.xmin))
     merged_lines: List[OCRBox] = []
     current_line: List[OCRBox] = [sorted_boxes[0]]
     
     for box in sorted_boxes[1:]:
         last = current_line[-1]
-        same_row = abs(box.center_y - last.center_y) <= y_tolerance or (box.ymin >= last.ymin - y_tolerance and box.ymax <= last.ymax + y_tolerance)
+        same_row = abs(box.center_y - last.center_y) <= y_tolerance or \
+                   (box.ymin >= last.ymin - y_tolerance and box.ymax <= last.ymax + y_tolerance)
         horizontal_gap = box.xmin - last.xmax
         
         if same_row and horizontal_gap <= x_gap_tolerance:
             current_line.append(box)
         else:
-            # Selesai 1 baris, gabungkan dari kiri ke kanan
             current_line.sort(key=lambda b: b.xmin)
             merged_text = " ".join(b.text for b in current_line)
-            # Bersihkan spasi berlebih
             merged_text = re.sub(r'\s*:\s*', ' : ', merged_text)
             merged_text = re.sub(r'\s+', ' ', merged_text).strip()
-            
-            # Bersihkan per-line OCR typo
             merged_text = clean_ocr_line(merged_text)
             
             merged_lines.append(OCRBox(
@@ -79,8 +96,6 @@ def cluster_and_merge_lines(boxes: List[OCRBox], y_tolerance: float = None, x_ga
         current_line.sort(key=lambda b: b.xmin)
         merged_text = re.sub(r'\s*:\s*', ' : ', " ".join(b.text for b in current_line))
         merged_text = re.sub(r'\s+', ' ', merged_text).strip()
-        
-        # Bersihkan per-line OCR typo
         merged_text = clean_ocr_line(merged_text)
         
         merged_lines.append(OCRBox(
@@ -95,8 +110,14 @@ def cluster_and_merge_lines(boxes: List[OCRBox], y_tolerance: float = None, x_ga
         
     return merged_lines
 
+
+# ============================================================================
+# PaddleOCR Parser Class
+# ============================================================================
+
 class PaddleOCRParser:
     _ocr_engine = None
+    _layout_parser = None
 
     @classmethod
     def get_engine(cls):
@@ -104,14 +125,23 @@ class PaddleOCRParser:
             cls._ocr_engine = PaddleOCR(use_angle_cls=True, lang="en")
         return cls._ocr_engine
 
+    @classmethod
+    def get_layout_parser(cls):
+        """Lazy-load LayoutParser (PPStructure). Returns None jika tidak tersedia."""
+        if cls._layout_parser is None and config.ENABLE_LAYOUT_ANALYSIS:
+            try:
+                from app.parsers.layout_parser import LayoutParser
+                cls._layout_parser = LayoutParser()
+                logger.info("🏗️  Layout parser (PPStructure) loaded")
+            except Exception as e:
+                logger.warning(f"⚠️  Layout parser tidak tersedia, fallback ke spatial clustering: {e}")
+                cls._layout_parser = False  # False = tried and failed
+        return cls._layout_parser if cls._layout_parser is not False else None
+
     def _classify_element_type(self, text_content: str) -> str:
-        """
-        Deteksi tipe elemen layout berdasarkan konten teks.
-        Lebih presisi daripada hardcoded if-elif chain.
-        """
+        """Deteksi tipe elemen layout berdasarkan konten teks."""
         text_upper = text_content.upper().strip()
         
-        # Header detection — judul dokumen utama
         header_keywords = [
             "SURAT PERINTAH KERJA", "SURAT PENAWARAN", "BERITA ACARA", 
             "PERJANJIAN KERJASAMA", "LAMPIRAN", "KONTRAK PENGADAAN"
@@ -119,20 +149,16 @@ class PaddleOCRParser:
         if any(h in text_upper for h in header_keywords):
             return "header"
         
-        # Header detection — nomor pasal (misal: "1. LINGKUP PEKERJAAN")
-        if re.match(r'^\d+[\.\)]\s*[A-Z\s]{3,}', text_content):
+        if re.match(r'^\d+[\.)\]]\s*[A-Z\s]{3,}', text_content):
             return "header"
         
-        # Key-value pairs (misal: "Nama : Mohamad Veni")
         if ":" in text_content and len(text_content) < 120:
             return "key_value"
         
-        # Table elements
         table_keywords = ["uraian barang", "harga satuan", "jumlah harga", "sub total", "ppn 11%", "ppn11%"]
         if "|" in text_content or any(col in text_content.lower() for col in table_keywords):
             return "table"
         
-        # Signature zone — hanya jika teks pendek DAN mengandung indikator tanda tangan
         signature_keywords = ["METERAI TEMPEL", "METERAI", "TANDA TANGAN"]
         if len(text_content) < 60 and any(s in text_upper for s in signature_keywords):
             return "signature"
@@ -140,26 +166,142 @@ class PaddleOCRParser:
         return "paragraph"
 
     def _is_footer_noise(self, text_content: str) -> bool:
-        """
-        Deteksi apakah teks ini adalah footer noise (alamat kampus, URL, etc.)
-        yang tidak relevan untuk extraction.
-        """
+        """Deteksi footer noise."""
         noise_indicators = [
             "www.", ".ac.id", ".co.id", ".com",
             "Main Campus", "Jakarta Campus", "Surabaya Campus", "Purwokerto Campus"
         ]
-        # Teks panjang yang mengandung banyak alamat kampus → noise
         if len(text_content) > 200 and any(n in text_content for n in noise_indicators):
             return True
-        # URL standalone
         if re.match(r'^(https?://)?www\.\S+$', text_content.strip()):
             return True
         return False
 
-    def parse(self, pdf_path: str, max_pages: int = None) -> LandingAIParsedResponse:
+    # ========================================================================
+    # LAYOUT MODE — PP-Structure
+    # ========================================================================
+
+    def _parse_with_layout(self, pdf_path: str, max_pages: int = None) -> LandingAIParsedResponse:
         """
-        Memproses Dokumen Scan / Tanda Tangan Menggunakan PaddleOCR dengan Spatial Layout Assembly.
-        Menghasilkan Visual Grounding Bounding Box dan Markdown Bersih berkualitas tinggi.
+        Layout-aware parsing menggunakan PP-Structure.
+        Mendeteksi region (text/table/title/figure) dan merekonstruksi markdown terstruktur.
+        """
+        start_time = time.time()
+        layout_parser = self.get_layout_parser()
+        doc = fitz.open(pdf_path)
+        
+        pages_structure = []
+        full_markdown_parts = []
+        char_offset = 0
+        
+        total_pages = len(doc)
+        pages_to_process = min(total_pages, max_pages) if max_pages else total_pages
+        
+        logger.info(f"🏗️  PP-Structure Layout Mode: Memproses {pages_to_process}/{total_pages} halaman")
+        
+        for page_idx in range(pages_to_process):
+            page = doc[page_idx]
+            page_num = page_idx + 1
+            
+            pix = page.get_pixmap(dpi=config.DEFAULT_DPI)
+            img_bytes = pix.tobytes("png")
+            img_w = pix.width
+            img_h = pix.height
+            
+            # Run PP-Structure layout detection
+            regions = layout_parser.parse_page_layout(img_bytes, img_w, img_h, page_num)
+            
+            # Convert regions to markdown
+            page_md = layout_parser.regions_to_markdown(regions)
+            
+            # Build structure items from regions
+            page_items: List[StructureItem] = []
+            for idx, region in enumerate(regions):
+                start_char = char_offset
+                end_char = start_char + len(region.text)
+                
+                bbox = BoundingBox(
+                    xmin=region.norm_xmin, ymin=region.norm_ymin,
+                    xmax=region.norm_xmax, ymax=region.norm_ymax
+                )
+                
+                st_item = StructureItem(
+                    type=region.region_type,
+                    id=f"{region.region_type}-p{page_num}-{idx}",
+                    text=region.text,
+                    grounding=Grounding(
+                        page=page_num,
+                        range=TextRange(start=start_char, end=end_char),
+                        box=bbox,
+                        confidence=round(region.confidence, 3)
+                    ),
+                    atomic_grounding=[
+                        AtomicGrounding(
+                            page=page_num,
+                            range=TextRange(start=start_char, end=end_char),
+                            box=bbox,
+                            text=region.text,
+                            confidence=round(region.confidence, 3)
+                        )
+                    ],
+                    confidence=round(region.confidence, 3)
+                )
+                page_items.append(st_item)
+            
+            full_markdown_parts.append(page_md)
+            char_offset += len(page_md) + 20
+            
+            pages_structure.append(
+                StructureItem(
+                    type="page",
+                    id=f"page-{page_num}",
+                    grounding=Grounding(
+                        page=page_num,
+                        range=TextRange(start=0, end=len(page_md)),
+                        box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0),
+                        confidence=1.0
+                    ),
+                    children=page_items,
+                    confidence=1.0
+                )
+            )
+            
+            # Log region summary
+            table_count = sum(1 for r in regions if r.region_type == "table")
+            figure_count = sum(1 for r in regions if r.region_type == "figure")
+            logger.info(
+                f"  Page {page_num}: {len(regions)} regions "
+                f"({table_count} tables, {figure_count} figures)"
+            )
+        
+        doc.close()
+        raw_markdown = "\n\n<!-- PAGE BREAK -->\n\n".join(full_markdown_parts)
+        cleaned_markdown = clean_ocr_text(raw_markdown)
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        logger.info(f"✅ PP-Structure selesai: {len(pages_structure)} halaman, {len(cleaned_markdown)} karakter, {duration_ms}ms")
+        
+        return LandingAIParsedResponse(
+            markdown=cleaned_markdown,
+            metadata=ParseMetadata(
+                job_id=f"parse-ppstructure-{int(time.time())}",
+                page_count=len(pages_structure),
+                output_markdown_chars=len(cleaned_markdown),
+                duration_ms=duration_ms,
+                is_scanned=True,
+                parser_engine="ppstructure+slanet"
+            ),
+            structure=DocumentStructure(children=pages_structure)
+        )
+
+    # ========================================================================
+    # FALLBACK MODE — PaddleOCR + Spatial Clustering
+    # ========================================================================
+
+    def _parse_with_ocr(self, pdf_path: str, max_pages: int = None) -> LandingAIParsedResponse:
+        """
+        Fallback: PaddleOCR + spatial clustering tanpa layout analysis.
+        Digunakan ketika PP-Structure tidak tersedia.
         """
         start_time = time.time()
         ocr = self.get_engine()
@@ -172,13 +314,12 @@ class PaddleOCRParser:
         total_pages = len(doc)
         pages_to_process = min(total_pages, max_pages) if max_pages else total_pages
         
-        logger.info(f"🔍 PaddleOCR: Memproses {pages_to_process}/{total_pages} halaman")
+        logger.info(f"🔍 PaddleOCR Fallback Mode: Memproses {pages_to_process}/{total_pages} halaman")
         
         for page_idx in range(pages_to_process):
             page = doc[page_idx]
             page_num = page_idx + 1
             
-            # Render page to DPI image (configurable)
             pix = page.get_pixmap(dpi=config.DEFAULT_DPI)
             img_bytes = pix.tobytes("png")
             img_w = pix.width
@@ -204,21 +345,12 @@ class PaddleOCRParser:
                     ymax = round(max(0.0, min(1.0, max(ys) / img_h)), 5)
                     
                     raw_boxes.append(OCRBox(
-                        text=text_content,
-                        xmin=xmin,
-                        ymin=ymin,
-                        xmax=xmax,
-                        ymax=ymax,
-                        center_y=(ymin + ymax) / 2,
-                        confidence=confidence
+                        text=text_content, xmin=xmin, ymin=ymin,
+                        xmax=xmax, ymax=ymax,
+                        center_y=(ymin + ymax) / 2, confidence=confidence
                     ))
             
-            logger.debug(f"  Halaman {page_num}: {len(raw_boxes)} raw boxes terdeteksi")
-                    
-            # Cluster and merge horizontal fragments into coherent reading lines
             merged_lines = cluster_and_merge_lines(raw_boxes)
-            
-            logger.debug(f"  Halaman {page_num}: {len(merged_lines)} merged lines setelah clustering")
             
             page_items: List[StructureItem] = []
             page_md_lines = []
@@ -226,26 +358,17 @@ class PaddleOCRParser:
             for item_idx, line in enumerate(merged_lines):
                 text_content = line.text
                 
-                # Skip footer noise
                 if self._is_footer_noise(text_content):
-                    logger.debug(f"  Skipped footer noise: {text_content[:50]}...")
                     continue
                 
                 start_char = char_offset + sum(len(l) + 1 for l in page_md_lines)
                 end_char = start_char + len(text_content)
-                
-                # Deteksi tipe elemen layout (menggunakan method yang lebih presisi)
                 elem_type = self._classify_element_type(text_content)
                 
-                # Format markdown berdasarkan tipe
                 if elem_type == "header":
                     page_md_lines.append(f"\n## {text_content}")
                 elif elem_type == "signature":
                     page_md_lines.append(f"[SIGNED] {text_content}")
-                elif elem_type == "key_value":
-                    page_md_lines.append(text_content)
-                elif elem_type == "table":
-                    page_md_lines.append(text_content)
                 else:
                     page_md_lines.append(text_content)
                     
@@ -262,10 +385,8 @@ class PaddleOCRParser:
                     ),
                     atomic_grounding=[
                         AtomicGrounding(
-                            page=page_num,
-                            range=TextRange(start=start_char, end=end_char),
-                            box=bbox,
-                            text=text_content,
+                            page=page_num, range=TextRange(start=start_char, end=end_char),
+                            box=bbox, text=text_content,
                             confidence=round(line.confidence, 3)
                         )
                     ],
@@ -279,25 +400,19 @@ class PaddleOCRParser:
             
             pages_structure.append(
                 StructureItem(
-                    type="page",
-                    id=f"page-{page_num}",
+                    type="page", id=f"page-{page_num}",
                     grounding=Grounding(
-                        page=page_num,
-                        range=TextRange(start=0, end=len(page_md)),
+                        page=page_num, range=TextRange(start=0, end=len(page_md)),
                         box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0),
                         confidence=1.0
                     ),
-                    children=page_items,
-                    confidence=1.0
+                    children=page_items, confidence=1.0
                 )
             )
             
         doc.close()
         raw_markdown = "\n\n<!-- PAGE BREAK -->\n\n".join(full_markdown_parts)
-        
-        # Apply full OCR text cleaning pada final markdown
         cleaned_markdown = clean_ocr_text(raw_markdown)
-        
         duration_ms = int((time.time() - start_time) * 1000)
         
         logger.info(f"✅ PaddleOCR selesai: {len(pages_structure)} halaman, {len(cleaned_markdown)} karakter, {duration_ms}ms")
@@ -314,3 +429,24 @@ class PaddleOCRParser:
             ),
             structure=DocumentStructure(children=pages_structure)
         )
+
+    # ========================================================================
+    # Public API
+    # ========================================================================
+
+    def parse(self, pdf_path: str, max_pages: int = None) -> LandingAIParsedResponse:
+        """
+        Memproses dokumen scan menggunakan strategi terbaik yang tersedia:
+        1. PP-Structure (layout + table) jika tersedia dan enabled
+        2. PaddleOCR + spatial clustering sebagai fallback
+        """
+        layout_parser = self.get_layout_parser()
+        
+        if layout_parser is not None:
+            try:
+                return self._parse_with_layout(pdf_path, max_pages)
+            except Exception as e:
+                logger.warning(f"⚠️  PP-Structure gagal, fallback ke PaddleOCR: {e}")
+                return self._parse_with_ocr(pdf_path, max_pages)
+        else:
+            return self._parse_with_ocr(pdf_path, max_pages)

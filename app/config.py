@@ -32,6 +32,12 @@ class AppConfig(BaseModel):
     # Grounding Linker settings
     GROUNDING_MIN_SCORE: float = 0.25  # Minimum score untuk match bounding box
     
+    # PP-Structure Layout Analysis settings
+    ENABLE_LAYOUT_ANALYSIS: bool = True   # Gunakan PPStructure untuk scanned docs
+    ENABLE_TABLE_RECOGNITION: bool = True # Aktifkan SLANet table recognition
+    LAYOUT_SCORE_THRESHOLD: float = 0.5  # Minimum confidence untuk layout region
+    TABLE_MAX_CELLS: int = 500            # Skip tabel dengan sel lebih dari ini
+    
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
