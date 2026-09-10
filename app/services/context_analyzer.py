@@ -143,28 +143,67 @@ class ContextAnalyzer:
         
         return entities
 
+    @staticmethod
+    def normalize_indonesian_numbers(text: str) -> str:
+        """
+        Mengkonversi format angka Indonesia ke plain numbers sebelum dikirim ke LLM.
+        
+        Indonesian format: 13.500.000 (dots as thousand separators)
+        Output: 13500000
+        
+        Rules:
+        - Match patterns: digits.digits.digits (at least 2 groups separated by dots)
+        - Each group must be exactly 3 digits (except the first which can be 1-3)
+        - Preserve numbers that are NOT Indonesian format (e.g., IP addresses, versions)
+        - Handle optional "Rp", "Rp.", "IDR" prefixes  
+        - Handle trailing ",- " or ", -" suffixes
+        """
+        def _replace_id_number(match):
+            full = match.group(0)
+            # Extract the number part (remove Rp prefix and trailing suffix)
+            prefix = match.group(1) or ""  # "Rp. " etc
+            number_part = match.group(2)
+            suffix = match.group(3) or ""  # ",- " etc
+            
+            # Remove dots to get plain number
+            plain = number_part.replace(".", "")
+            return f"{prefix}{plain}{suffix}"
+        
+        # Pattern: optional Rp prefix + Indonesian formatted number + optional trailing
+        # Indonesian number: 1-3 digits, then groups of exactly 3 digits separated by dots
+        pattern = r'((?:Rp\.?\s*)?)((?:\d{1,3})(?:\.\d{3}){2,})((?:\s*,\s*-)?)'
+        
+        result = re.sub(pattern, _replace_id_number, text)
+        
+        # Count changes for logging
+        changes = len(re.findall(pattern, text))
+        if changes > 0:
+            logger.info(f"  💱 Normalized {changes} Indonesian-formatted numbers")
+        
+        return result
+
     def enrich_markdown(self, markdown_text: str) -> str:
         """
         Menambahkan context annotations ke markdown untuk membantu LLM.
         
-        Contoh output:
-        ```
-        [SECTION: PEMBAYARAN]
-        a) Pembayaran akan dilaksanakan oleh PIHAK PERTAMA...
-        [KEY: Nama Bank = Bank Mandiri]
-        [KEY: Nomor Rekening = 131.00.8888818.7]
-        ```
+        Steps:
+        1. Normalize Indonesian numbers (13.500.000 → 13500000)
+        2. Detect sections and entities
+        3. Add [SECTION:] and [KEY:] annotations
         """
-        sections = self.detect_sections(markdown_text)
-        entities = self.pre_extract_entities(markdown_text)
+        # Step 1: Normalize Indonesian number format FIRST
+        normalized_text = self.normalize_indonesian_numbers(markdown_text)
+        
+        sections = self.detect_sections(normalized_text)
+        entities = self.pre_extract_entities(normalized_text)
         
         if not sections and not entities:
-            return markdown_text
+            return normalized_text
         
         logger.info(f"🧠 Context Analyzer: {len(sections)} sections, {len(entities)} pre-extracted entities")
         
         # Build enriched version
-        lines = markdown_text.split('\n')
+        lines = normalized_text.split('\n')
         enriched_lines = list(lines)
         
         # Add section markers (insert from bottom to top to preserve line numbers)

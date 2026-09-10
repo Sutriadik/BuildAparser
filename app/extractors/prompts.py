@@ -11,6 +11,8 @@ ATURAN PENTING:
 3. Baca SELURUH teks sampai akhir sebelum menjawab. Informasi penting bisa ada di halaman terakhir.
 4. "Syarat Lampiran Wajib BAST" HANYA berisi nama dokumen lampiran, BUKAN data kontrak lainnya.
 5. Keluarkan HANYA JSON yang valid.
+6. FORMAT ANGKA INDONESIA: Titik (.) adalah pemisah ribuan, BUKAN desimal. "13.500.000" = 13500000, "207.600.000" = 207600000, "2.100.000" = 2100000. JANGAN konversi ke desimal!
+7. Jika ada annotation [KEY: ...] atau [SECTION: ...], gunakan sebagai petunjuk.
 
 PANDUAN PER-FIELD:
 - "Pihak Pertama": Pemberi perintah kerja / klien. Cari "PIHAK PERTAMA" atau "mewakili secara sah".
@@ -84,7 +86,8 @@ ATURAN PENTING:
 2. Teks mungkin mengandung typo OCR (misal: "Fortlnet" = "Fortinet", "Llcense" = "License"). Baca konteks.
 3. Baca SELURUH teks sampai akhir sebelum menjawab. Informasi bisa tersebar di berbagai bagian.
 4. Keluarkan HANYA JSON yang valid.
-5. Jika ada annotation [KEY: ...] atau [SECTION: ...], gunakan informasi tersebut sebagai petunjuk.
+5. FORMAT ANGKA INDONESIA: Titik (.) adalah pemisah ribuan, BUKAN desimal. "13.500.000" = 13500000, "85.000.000" = 85000000. JANGAN konversi ke desimal!
+6. Jika ada annotation [KEY: ...] atau [SECTION: ...], gunakan informasi tersebut sebagai petunjuk.
 
 PANDUAN PER-FIELD:
 - "Vendor": Perusahaan yang MENGAJUKAN penawaran. Cari kop surat, header, atau "Hormat kami,".

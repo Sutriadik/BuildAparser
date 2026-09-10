@@ -75,6 +75,19 @@ class OllamaExtractor:
         """
         merged = original.copy()
         
+        # Filter out LLM placeholder/refusal strings
+        PLACEHOLDER_PATTERNS = [
+            "informasi tidak", "tidak tersedia", "tidak disebutkan", 
+            "tidak disediakan", "tidak ada", "tidak ditemukan",
+            "information not", "not available", "not found", "n/a"
+        ]
+        
+        def _is_placeholder(val) -> bool:
+            if not isinstance(val, str):
+                return False
+            v = val.strip().lower()
+            return any(p in v for p in PLACEHOLDER_PATTERNS) or v in ["null", "none", "-", ""]
+        
         for key, value in retry_result.items():
             if key not in merged:
                 continue
@@ -82,7 +95,7 @@ class OllamaExtractor:
             if isinstance(value, dict) and isinstance(merged.get(key), dict):
                 merged[key] = self._merge_retry_result(merged[key], value)
             elif merged.get(key) is None or merged.get(key) == "" or merged.get(key) == 0.0:
-                if value is not None and value != "" and value != 0.0:
+                if value is not None and value != "" and value != 0.0 and not _is_placeholder(value):
                     merged[key] = value
                     logger.info(f"  🔄 Retry filled: {key} = {str(value)[:80]}")
         
@@ -109,6 +122,22 @@ class OllamaExtractor:
         
         json_str = response["message"]["content"]
         return schema_class.model_validate_json(json_str)
+
+    @staticmethod
+    def _is_placeholder_value(val) -> bool:
+        """Check if a value is a LLM placeholder/refusal string that should be treated as null."""
+        if val is None:
+            return True
+        if not isinstance(val, str):
+            return False
+        v = val.strip().lower()
+        patterns = [
+            "informasi tidak", "tidak tersedia", "tidak disebutkan",
+            "tidak disediakan", "tidak ada", "tidak ditemukan",
+            "information not", "not available", "not found", "n/a",
+            "tidak diketahui", "belum tersedia"
+        ]
+        return any(p in v for p in patterns) or v in ["null", "none", "-", "", "[]"]
 
     def _extract_targeted_clauses(self, markdown_text: str, null_fields: List[str]) -> Dict[str, Any]:
         """
@@ -151,7 +180,7 @@ class OllamaExtractor:
                     if start_j != -1 and end_j != -1:
                         clause_json = json.loads(content[start_j:end_j+1])
                         for k, v in clause_json.items():
-                            if v and str(v).lower() not in ["null", "none", "tidak tersedia", "-"]:
+                            if v and not self._is_placeholder_value(v):
                                 found_data[k] = v
                 except Exception as e:
                     logger.debug(f"Targeted bank extraction failed: {e}")
@@ -188,7 +217,7 @@ class OllamaExtractor:
                     if start_j != -1 and end_j != -1:
                         clause_json = json.loads(content[start_j:end_j+1])
                         for k, v in clause_json.items():
-                            if v and str(v).lower() not in ["null", "none", "tidak tersedia", "-", "[]"]:
+                            if v and not self._is_placeholder_value(v):
                                 found_data[k] = v
                 except Exception as e:
                     logger.debug(f"Targeted duration extraction failed: {e}")
