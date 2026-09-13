@@ -1,244 +1,170 @@
 """
-Open ADE — Docling Parser (v2: Universal Mode)
+Open ADE — Docling Parser (v3: routed OCR)
 
-Menggunakan IBM Docling untuk parsing PDF dengan dukungan:
-- PDF Digital Native: text extraction + table structure
-- PDF Scanned: OCR + table structure (do_ocr=True)
-- Bounding box normalization yang akurat dari page dimensions
+- PDF digital: Docling tanpa OCR (layout + TableFormer saja).
+- PDF scan / mixed: Docling dengan OCR.
+Converter dibuat lazy per mode, sehingga import docling/torch dan pemuatan model OCR
+hanya terjadi saat benar-benar dibutuhkan (startup API tidak lagi memuat semua model).
 """
 import time
-from typing import Dict, Any, List
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.datamodel.base_models import InputFormat
+from typing import Dict, List, Optional
+
 from app.logger import logger
 from app.parsers.text_cleaner import clean_ocr_text
 from app.schemas.common import (
-    LandingAIParsedResponse, 
-    ParseMetadata, 
-    DocumentStructure, 
-    StructureItem, 
-    Grounding, 
-    BoundingBox, 
+    AtomicGrounding,
+    BoundingBox,
+    DocumentStructure,
+    Grounding,
+    LandingAIParsedResponse,
+    ParseMetadata,
+    StructureItem,
     TextRange,
-    AtomicGrounding
 )
+
+NATIVE_CONFIDENCE = 0.97
+OCR_CONFIDENCE = 0.90
 
 
 class DoclingParser:
-    def __init__(self, do_ocr: bool = True):
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = do_ocr
-        pipeline_options.do_table_structure = True
-        
-        self.converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
-        self.do_ocr = do_ocr
-        logger.info(f"📄 DoclingParser initialized (OCR: {do_ocr}, Table Structure: True)")
+    def __init__(self) -> None:
+        self._converters: Dict[bool, object] = {}
 
-    def _get_page_dimensions(self, doc, page_no: int) -> tuple:
-        """Get page width and height from Docling document for accurate bbox normalization."""
+    def _get_converter(self, do_ocr: bool):
+        if do_ocr not in self._converters:
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+
+            options = PdfPipelineOptions()
+            options.do_ocr = do_ocr
+            options.do_table_structure = True
+            self._converters[do_ocr] = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+            )
+            logger.info(f"📄 Docling converter dimuat (OCR: {do_ocr}, Table Structure: True)")
+        return self._converters[do_ocr]
+
+    @staticmethod
+    def _get_page_dimensions(doc, page_no: int) -> tuple:
         try:
-            pages = getattr(doc, 'pages', {})
-            if pages and page_no in pages:
-                page = pages[page_no]
-                size = getattr(page, 'size', None)
-                if size:
-                    w = getattr(size, 'width', 612)
-                    h = getattr(size, 'height', 792)
-                    return (max(w, 1), max(h, 1))
+            page = (getattr(doc, "pages", {}) or {}).get(page_no)
+            size = getattr(page, "size", None)
+            if size:
+                return max(getattr(size, "width", 612), 1), max(getattr(size, "height", 792), 1)
         except Exception:
             pass
-        return (612, 792)  # Default US Letter
+        return 612, 792
 
-    def _normalize_bbox(self, bbox_obj, page_w: float, page_h: float) -> BoundingBox:
-        """Normalize bbox coordinates to 0-1 range using actual page dimensions."""
+    @staticmethod
+    def _normalize_bbox(bbox_obj, page_w: float, page_h: float) -> Optional[BoundingBox]:
+        """Docling memakai origin kiri-bawah; dikonversi ke origin kiri-atas ternormalisasi 0..1."""
         try:
-            l = getattr(bbox_obj, 'l', 0.0)
-            t = getattr(bbox_obj, 't', 0.0)
-            r = getattr(bbox_obj, 'r', page_w)
-            b = getattr(bbox_obj, 'b', page_h)
-            
-            return BoundingBox(
-                xmin=round(max(0.0, min(1.0, l / page_w)), 5),
-                ymin=round(max(0.0, min(1.0, t / page_h)), 5),
-                xmax=round(max(0.0, min(1.0, r / page_w)), 5),
-                ymax=round(max(0.0, min(1.0, b / page_h)), 5)
-            )
+            if hasattr(bbox_obj, "to_top_left_origin"):
+                bbox_obj = bbox_obj.to_top_left_origin(page_height=page_h)
+            l, t, r, b = bbox_obj.l, bbox_obj.t, bbox_obj.r, bbox_obj.b
         except Exception:
-            return BoundingBox(xmin=0.1, ymin=0.1, xmax=0.9, ymax=0.2)
+            return None
+        xs = sorted(round(max(0.0, min(1.0, v / page_w)), 5) for v in (l, r))
+        ys = sorted(round(max(0.0, min(1.0, v / page_h)), 5) for v in (t, b))
+        return BoundingBox(xmin=xs[0], ymin=ys[0], xmax=xs[1], ymax=ys[1])
 
-    def parse(self, pdf_path: str) -> LandingAIParsedResponse:
-        """
-        Memproses PDF (Digital Native atau Scanned) menggunakan IBM Docling.
-        Menghasilkan Markdown terstruktur dan LandingAI-compatible Structure JSON.
-        """
+    def parse(self, pdf_path: str, do_ocr: bool = True, max_pages: int = None) -> LandingAIParsedResponse:
         start_time = time.time()
-        conv_res = self.converter.convert(pdf_path)
-        doc = conv_res.document
-        
-        raw_markdown = doc.export_to_markdown()
-        
-        # Apply OCR text cleaning
-        markdown_text = clean_ocr_text(raw_markdown)
-        
-        duration_ms = int((time.time() - start_time) * 1000)
-        
-        # Cache page dimensions
+        converter = self._get_converter(do_ocr)
+        kwargs = {"page_range": (1, max_pages)} if max_pages else {}
+        doc = converter.convert(pdf_path, **kwargs).document
+
+        markdown_text = clean_ocr_text(doc.export_to_markdown())
+        confidence = OCR_CONFIDENCE if do_ocr else NATIVE_CONFIDENCE
         page_dims: Dict[int, tuple] = {}
-        
         page_children: Dict[int, List[StructureItem]] = {}
-        char_pointer = 0
-        
-        # Iterate over text items
+        search_from = 0
+
+        def locate(prov_list):
+            if not prov_list:
+                return 1, None
+            prov = prov_list[0]
+            page_no = getattr(prov, "page_no", 1)
+            if page_no not in page_dims:
+                page_dims[page_no] = self._get_page_dimensions(doc, page_no)
+            bbox = getattr(prov, "bbox", None)
+            return page_no, (self._normalize_bbox(bbox, *page_dims[page_no]) if bbox is not None else None)
+
+        def make_item(elem_type: str, item_id: str, text: str, page_no: int, bbox: Optional[BoundingBox],
+                      start: int, end: int, conf: float) -> StructureItem:
+            box = bbox or BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0)
+            grounding = Grounding(page=page_no, range=TextRange(start=start, end=end), box=box, confidence=conf)
+            return StructureItem(
+                type=elem_type, id=item_id, text=text, grounding=grounding, confidence=conf,
+                atomic_grounding=[AtomicGrounding(page=page_no, range=grounding.range, box=box, text=text, confidence=conf)],
+            )
+
         for idx, item in enumerate(doc.texts):
-            text_val = getattr(item, "text", "").strip()
+            text_val = (getattr(item, "text", "") or "").strip()
             if not text_val:
                 continue
-                
-            prov = getattr(item, "prov", [])
-            page_no = 1
-            bbox = BoundingBox(xmin=0.1, ymin=0.1, xmax=0.9, ymax=0.2)
-            
-            if prov and len(prov) > 0:
-                p = prov[0]
-                page_no = getattr(p, "page_no", 1)
-                b = getattr(p, "bbox", None)
-                
-                # Get cached page dimensions
-                if page_no not in page_dims:
-                    page_dims[page_no] = self._get_page_dimensions(doc, page_no)
-                page_w, page_h = page_dims[page_no]
-                
-                if b:
-                    bbox = self._normalize_bbox(b, page_w, page_h)
-            
-            start_pos = markdown_text.find(text_val, max(0, char_pointer - 50))
+            page_no, bbox = locate(getattr(item, "prov", []))
+
+            start_pos = markdown_text.find(text_val, max(0, search_from - 50))
             if start_pos == -1:
-                start_pos = char_pointer
-            end_pos = start_pos + len(text_val)
-            char_pointer = end_pos
-            
-            label = getattr(item, "label", "text").lower()
-            elem_type = "paragraph"
-            if "header" in label or "title" in label or text_val.startswith("#"):
+                start_pos, end_pos = search_from, search_from  # teks berubah oleh cleaner: range kosong, bukan range palsu
+            else:
+                end_pos = start_pos + len(text_val)
+                search_from = end_pos
+
+            label = str(getattr(item, "label", "text")).lower()
+            if "header" in label or "title" in label:
                 elem_type = "header"
-            elif "table" in label:
-                elem_type = "table"
             elif "list" in label:
                 elem_type = "list_item"
+            elif "footer" in label:
+                elem_type = "footer"
             elif ":" in text_val and len(text_val) < 100:
                 elem_type = "key_value"
-                
-            # Compute confidence based on source
-            confidence = 0.97 if not self.do_ocr else 0.90
-                
-            st_item = StructureItem(
-                type=elem_type,
-                id=f"{elem_type}-{idx}",
-                text=text_val,
-                grounding=Grounding(
-                    page=page_no,
-                    range=TextRange(start=start_pos, end=end_pos),
-                    box=bbox,
-                    confidence=confidence
-                ),
-                atomic_grounding=[
-                    AtomicGrounding(
-                        page=page_no,
-                        range=TextRange(start=start_pos, end=end_pos),
-                        box=bbox,
-                        text=text_val,
-                        confidence=confidence
-                    )
-                ],
-                confidence=confidence
+            else:
+                elem_type = "paragraph"
+            page_children.setdefault(page_no, []).append(
+                make_item(elem_type, f"{elem_type}-{idx}", text_val, page_no, bbox, start_pos, end_pos, confidence)
             )
-            page_children.setdefault(page_no, []).append(st_item)
-            
-        # Iterate over tables — extract table text for grounding
+
         for t_idx, table in enumerate(doc.tables):
-            prov = getattr(table, "prov", [])
-            page_no = 1
-            bbox = BoundingBox(xmin=0.1, ymin=0.3, xmax=0.9, ymax=0.7)
-            
-            if prov and len(prov) > 0:
-                p = prov[0]
-                page_no = getattr(p, "page_no", 1)
-                b = getattr(p, "bbox", None)
-                
-                if page_no not in page_dims:
-                    page_dims[page_no] = self._get_page_dimensions(doc, page_no)
-                page_w, page_h = page_dims[page_no]
-                
-                if b:
-                    bbox = self._normalize_bbox(b, page_w, page_h)
-            
-            # Extract table text for grounding linker
-            table_text = ""
+            page_no, bbox = locate(getattr(table, "prov", []))
             try:
-                table_df = table.export_to_dataframe()
-                table_text = " | ".join(str(c) for c in table_df.columns)
-                for _, row in table_df.iterrows():
-                    table_text += " | " + " | ".join(str(v) for v in row.values)
+                table_df = table.export_to_dataframe(doc=doc)
+                rows = [" | ".join(str(c) for c in table_df.columns)]
+                rows += [" | ".join(str(v) for v in row) for row in table_df.itertuples(index=False)]
+                table_text = "\n".join(rows)
             except Exception:
-                table_text = "[TABLE]"
-            
-            table_item = StructureItem(
-                type="table",
-                id=f"table-{t_idx}",
-                text=table_text[:500],  # Cap for grounding
-                grounding=Grounding(
-                    page=page_no,
-                    range=TextRange(start=0, end=len(markdown_text)),
-                    box=bbox,
-                    confidence=0.95
-                ),
-                atomic_grounding=[
-                    AtomicGrounding(
-                        page=page_no,
-                        range=TextRange(start=0, end=len(markdown_text)),
-                        box=bbox,
-                        text=table_text[:200],
-                        confidence=0.95
-                    )
-                ],
-                confidence=0.95
+                table_text = ""
+            if not table_text:
+                continue
+            page_children.setdefault(page_no, []).append(
+                make_item("table", f"table-{t_idx}", table_text[:2000], page_no, bbox, 0, 0, confidence)
             )
-            page_children.setdefault(page_no, []).append(table_item)
-            
-        pages_structure = []
-        for p_no in sorted(page_children.keys()):
-            pages_structure.append(
-                StructureItem(
-                    type="page",
-                    id=f"page-{p_no}",
-                    grounding=Grounding(
-                        page=p_no,
-                        range=TextRange(start=0, end=len(markdown_text)),
-                        box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0),
-                        confidence=1.0
-                    ),
-                    children=page_children[p_no],
-                    confidence=1.0
-                )
+
+        pages_structure = [
+            StructureItem(
+                type="page", id=f"page-{p_no}",
+                grounding=Grounding(page=p_no, range=TextRange(start=0, end=len(markdown_text)),
+                                    box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0), confidence=1.0),
+                children=page_children[p_no], confidence=1.0,
             )
-        
-        engine_name = "ibm-docling" + ("+ocr" if self.do_ocr else "")
+            for p_no in sorted(page_children)
+        ]
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        engine_name = "ibm-docling" + ("+ocr" if do_ocr else "")
         logger.info(f"✅ Docling selesai [{engine_name}]: {len(pages_structure)} halaman, {len(markdown_text)} karakter, {duration_ms}ms")
-            
         return LandingAIParsedResponse(
             markdown=markdown_text,
             metadata=ParseMetadata(
                 job_id=f"parse-docling-{int(time.time())}",
-                page_count=len(pages_structure) if pages_structure else 1,
+                page_count=len(pages_structure) or 1,
                 output_markdown_chars=len(markdown_text),
                 duration_ms=duration_ms,
-                is_scanned=self.do_ocr,
-                parser_engine=engine_name
+                is_scanned=do_ocr,
+                parser_engine=engine_name,
             ),
-            structure=DocumentStructure(children=pages_structure)
+            structure=DocumentStructure(children=pages_structure),
         )

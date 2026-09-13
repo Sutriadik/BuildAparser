@@ -10,14 +10,14 @@ Dua mode:
 Kedua mode menghasilkan output yang sama: LandingAIParsedResponse.
 """
 import time
-import fitz
+import pymupdf as fitz
 import re
 from typing import List, Optional
 from dataclasses import dataclass
-from paddleocr import PaddleOCR
 from app.config import config
 from app.logger import logger
 from app.parsers.text_cleaner import clean_ocr_text, clean_ocr_line
+from app.parsers.image_enhancer import render_pdf_page_high_res, preprocess_image_for_ocr
 from app.schemas.common import (
     LandingAIParsedResponse,
     ParseMetadata,
@@ -29,6 +29,8 @@ from app.schemas.common import (
     AtomicGrounding
 )
 
+
+MIN_TEXT_CHARS_PER_PAGE = 50
 
 # ============================================================================
 # OCR Box and Spatial Clustering (Fallback mode)
@@ -122,7 +124,9 @@ class PaddleOCRParser:
     @classmethod
     def get_engine(cls):
         if cls._ocr_engine is None:
-            cls._ocr_engine = PaddleOCR(use_angle_cls=True, lang="en")
+            # Import lazy: paddle (~430MB) hanya dimuat jika engine Paddle benar-benar dipakai.
+            from paddleocr import PaddleOCR
+            cls._ocr_engine = PaddleOCR(use_angle_cls=True, lang=config.OCR_LANG)
         return cls._ocr_engine
 
     @classmethod
@@ -221,8 +225,10 @@ class PaddleOCRParser:
                 end_char = start_char + len(region.text)
                 
                 bbox = BoundingBox(
-                    xmin=region.norm_xmin, ymin=region.norm_ymin,
-                    xmax=region.norm_xmax, ymax=region.norm_ymax
+                    xmin=min(region.norm_xmin, region.norm_xmax), 
+                    ymin=min(region.norm_ymin, region.norm_ymax),
+                    xmax=max(region.norm_xmin, region.norm_xmax), 
+                    ymax=max(region.norm_ymin, region.norm_ymax)
                 )
                 
                 st_item = StructureItem(
@@ -320,12 +326,11 @@ class PaddleOCRParser:
             page = doc[page_idx]
             page_num = page_idx + 1
             
-            pix = page.get_pixmap(dpi=config.DEFAULT_DPI)
-            img_bytes = pix.tobytes("png")
-            img_w = pix.width
-            img_h = pix.height
+            high_res_bgr = render_pdf_page_high_res(page, target_dpi=config.DEFAULT_DPI)
+            enhanced_bgr = preprocess_image_for_ocr(high_res_bgr)
+            img_h, img_w = enhanced_bgr.shape[:2]
             
-            ocr_results = ocr.ocr(img_bytes, cls=True)
+            ocr_results = ocr.ocr(enhanced_bgr, cls=True)
             raw_boxes: List[OCRBox] = []
             
             if ocr_results and ocr_results[0]:
@@ -444,9 +449,17 @@ class PaddleOCRParser:
         
         if layout_parser is not None:
             try:
-                return self._parse_with_layout(pdf_path, max_pages)
+                result = self._parse_with_layout(pdf_path, max_pages)
             except Exception as e:
                 logger.warning(f"⚠️  PP-Structure gagal, fallback ke PaddleOCR: {e}")
                 return self._parse_with_ocr(pdf_path, max_pages)
+            # Halaman scan penuh sering dideteksi sebagai satu region "figure" sehingga teksnya
+            # tidak pernah di-OCR (hasil hanya penanda [IMAGE]). Jika begitu, OCR ulang tanpa layout.
+            real_chars = len(re.sub(r'\[IMAGE[^\]]*\]|\s+', '', result.markdown))
+            if real_chars < MIN_TEXT_CHARS_PER_PAGE * max(result.metadata.page_count, 1):
+                logger.warning(f"⚠️  PP-Structure hanya menghasilkan {real_chars} karakter teks "
+                               f"({result.metadata.page_count} hlm) → OCR ulang tanpa layout analysis")
+                return self._parse_with_ocr(pdf_path, max_pages)
+            return result
         else:
             return self._parse_with_ocr(pdf_path, max_pages)

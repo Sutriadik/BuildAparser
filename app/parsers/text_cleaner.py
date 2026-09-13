@@ -75,8 +75,10 @@ def fix_missing_spaces(text: str) -> str:
     # Angka menempel huruf: "29Mei" → "29 Mei", "11Kedaung" → "11 Kedaung"
     text = re.sub(r'(\d)([A-Z][a-z])', r'\1 \2', text)
     
-    # Huruf kecil menempel huruf besar: "InformasiUniversitas" → "Informasi Universitas"
-    text = re.sub(r'([a-z])([A-Z][a-z])', r'\1 \2', text)
+    # Kata menempel kata: "InformasiUniversitas" → "Informasi Universitas".
+    # Kata kiri minimal 6 huruf supaya nama produk CamelCase (FortiGate, PowerEdge,
+    # SharePoint, McAfee) tidak ikut dipecah.
+    text = re.sub(r'(?<![A-Za-z])([A-Z]?[a-z]{5,})([A-Z][a-z]{2,})', r'\1 \2', text)
     
     # "sebesarRp" → "sebesar Rp"
     text = re.sub(r'([a-z])(Rp[\.\s])', r'\1 \2', text)
@@ -87,8 +89,12 @@ def fix_missing_spaces(text: str) -> str:
     # Titik menempel huruf besar (awal kalimat baru): "terlampir.Berdasarkan" → "terlampir. Berdasarkan"
     text = re.sub(r'\.([A-Z])', r'. \1', text)
     
-    # Koma menempel huruf: "Bandung,40257" → "Bandung, 40257"
-    text = re.sub(r',(\S)', r', \1', text)
+    # Koma menempel huruf: "Bandung,40257" → "Bandung, 40257".
+    # Koma setelah digit TIDAK disentuh: "174.825.000,00", "1,5", "Rp 5.000,-" harus utuh.
+    text = re.sub(r'(?<!\d),(?=[^\s,])', ', ', text)
+
+    # Typo OCR "JI." (huruf I) untuk singkatan "Jl." (Jalan)
+    text = re.sub(r'\bJI\.(?=\s*[A-Z0-9])', 'Jl.', text)
     
     # Titik dua menempel huruf/angka (tapi jangan pecah timestamp/nomor): 
     # "Nomor:" ok, tapi "Alamat:Jl." → "Alamat: Jl."

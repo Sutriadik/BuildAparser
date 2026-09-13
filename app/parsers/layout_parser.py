@@ -12,7 +12,6 @@ Menggantikan flat OCR approach dengan region-aware assembly.
 """
 import re
 import time
-import fitz
 import numpy as np
 from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field
@@ -67,7 +66,7 @@ class LayoutParser:
             cls._engine = PPStructure(
                 show_log=False,
                 recovery=True,
-                lang="en",
+                lang=config.OCR_LANG,
                 use_gpu=False,
             )
             logger.info("🏗️  PP-Structure engine initialized")

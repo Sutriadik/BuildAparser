@@ -1,28 +1,41 @@
-from typing import List, Optional, Union
-from pydantic import BaseModel, Field
+from typing import List, Optional, Union, Dict, Any
+from pydantic import BaseModel, Field, ConfigDict
 
 class PihakDetail(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     nama_perusahaan: str = Field(..., alias="Nama Perusahaan", description="Nama institusi atau perusahaan yang diwakili")
     nama_representative: str = Field(..., alias="Nama Representative", description="Nama pejabat atau pihak yang menandatangani")
     jabatan: str = Field(..., alias="Jabatan", description="Jabatan pejabat terkait")
     alamat: str = Field(..., alias="Alamat", description="Alamat lengkap domisili instansi/perusahaan")
 
 class ItemBarangPekerjaan(BaseModel):
-    nomor_item: Optional[str] = Field("1", alias="Nomor Item")
-    deskripsi: str = Field(..., alias="Deskripsi Item/Barang/Pekerjaan", description="Uraian nama barang, spesifikasi teknis, atau layanan")
+    model_config = ConfigDict(populate_by_name=True)
+    nomor_item: Optional[str] = Field(
+        None, 
+        alias="Nomor Item", 
+        description="Nomor urut baris item pekerjaan dalam tabel secara berurutan (misal: 1, 2, 3, dst.)"
+    )
+    kategori: Optional[str] = Field(None, alias="Kategori/Kelompok", description="Kategori kelompok pekerjaan (misal: Tenaga Ahli, Non Personil, Hardware, Jasa)")
+    deskripsi: str = Field(..., alias="Deskripsi Item/Barang/Pekerjaan", description="Uraian redaksi lengkap nama barang, spesifikasi teknis, atau layanan")
+    spesifikasi: Optional[str] = Field(None, alias="Spesifikasi", description="Spesifikasi teknis, part number, atau cakupan layanan")
     volume: float = Field(..., alias="volume", description="Jumlah kuantitas/volume barang")
-    unit: str = Field(..., alias="unit", description="Satuan unit (misal: pkt, unit, bulan, pcs)")
+    unit: str = Field(..., alias="unit", description="Satuan unit (misal: pkt, unit, bulan, pcs, Orang. Bulan, dsb)")
+    periode: Optional[str] = Field(None, alias="Periode/Durasi", description="Periode waktu atau durasi bulanan/harian jika ada")
     harga_satuan: float = Field(..., alias="Harga Satuan", description="Harga satuan per unit dalam Rupiah")
     jumlah_harga: float = Field(..., alias="Jumlah Harga", description="Total harga item dalam Rupiah")
+    keterangan: Optional[str] = Field(None, alias="Keterangan", description="Catatan atau keterangan khusus pada baris tabel")
+    extra_attributes: Optional[Dict[str, Any]] = Field(None, alias="Atribut Tambahan", description="Kolom atau atribut fleksibel lainnya dari tabel (OTC, MRC, dll)")
 
 class ContractExtractionSchema(BaseModel):
     """
-    1-to-1 Compatible Schema dengan LandingAI ADE Extract untuk Dokumen Kontrak & SPK.
+    1-to-1 Compatible Schema dengan LandingAI ADE Extract untuk Dokumen Kontrak & SPK,
+    dilengkapi dukungan ekstraksi tabel fleksibel & redaksi lengkap.
     """
+    model_config = ConfigDict(populate_by_name=True)
     pihak_pertama: PihakDetail = Field(..., alias="Pihak Pertama", description="Pihak pemberi perintah kerja / klien")
     pihak_kedua: PihakDetail = Field(..., alias="Pihak Kedua", description="Pihak penerima perintah kerja / penyedia")
     
-    items: List[ItemBarangPekerjaan] = Field(..., alias="List Item/Barang", description="Daftar rincian barang, jasa, atau BoQ")
+    items: List[ItemBarangPekerjaan] = Field(..., alias="List Item/Barang", description="Daftar rincian lengkap seluruh baris tabel barang, jasa, atau BoQ")
     
     nomor_kontrak: str = Field(..., alias="Nomor Kontrak Kerja", description="Nomor resmi Surat Perintah Kerja / Kontrak")
     tanggal_negosiasi: Optional[str] = Field(None, alias="Tanggal Negosiasi", description="Tanggal dilakukannya negosiasi harga (format: YYYY-MM-DD atau teks asli)")
@@ -54,6 +67,5 @@ class ContractExtractionSchema(BaseModel):
     
     garansi: Optional[str] = Field(None, alias="Garansi", description="Klausul garansi atau SLA")
     syarat_lampiran_bast: Optional[List[str]] = Field(None, alias="Syarat Lampiran Wajib BAST", description="Dokumen yang wajib disertakan saat BAST")
+    daftar_tabel_terstruktur: Optional[List[Dict[str, Any]]] = Field(None, alias="Daftar Tabel Terstruktur", description="Representasi tabel utuh dari dokumen jika ada tabel tambahan")
 
-    class Config:
-        populate_by_name = True

@@ -1,19 +1,24 @@
 # Core Document Parsing & Layout Analysis
 docling>=2.0.0
-paddleocr>=2.7.0
-paddlepaddle>=2.5.0
-pdfplumber>=0.11.0
 pymupdf>=1.24.0
 pillow>=10.0.0
 
+# OCR fallback engine (dimuat lazy; ~600MB bersama paddlepaddle + paddlex).
+# Pertimbangkan dipisah ke requirements-ocr.txt setelah benchmark Docling OCR vs Paddle (Plan Phase 7).
+paddleocr>=2.7.0,<3.0
+paddlepaddle>=2.5.0
+
 # Schema & AI Extraction Layer
 pydantic>=2.9.0
-pydantic-ai>=2.40.0
 ollama>=0.6.0
 
 # API & Web Framework
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
-requests>=2.31.0
-httpx>=0.27.0
+
+# Dihapus karena tidak di-import di kode mana pun:
+# - pydantic-ai     (menarik google-genai, openai, logfire, dll.)
+# - pdfplumber      (PyMuPDF sudah dipakai untuk teks native & profiling)
+# - requests, httpx (httpx tetap terpasang sebagai dependency ollama)
+# Tools notebook (jupyter) sebaiknya di requirements-dev.txt terpisah.

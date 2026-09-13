@@ -41,6 +41,8 @@ def setup_logger(
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    # Paddle memasang handler di root logger; tanpa ini setiap log tercetak dua kali.
+    logger.propagate = False
     
     return logger
 
