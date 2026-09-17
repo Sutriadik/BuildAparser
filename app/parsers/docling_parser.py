@@ -1,15 +1,23 @@
 """
-Open ADE — Docling Parser (v3: routed OCR)
+Open ADE — Docling Parser (v4: native layout labels + picture detection + block grouping)
 
 - PDF digital: Docling tanpa OCR (layout + TableFormer saja).
 - PDF scan / mixed: Docling dengan OCR.
 Converter dibuat lazy per mode, sehingga import docling/torch dan pemuatan model OCR
 hanya terjadi saat benar-benar dibutuhkan (startup API tidak lagi memuat semua model).
+
+Layout awareness (v4): Docling sudah menghasilkan label layout asli (section_header,
+caption, list_item, dst.) dan deteksi gambar (doc.pictures) -- versi sebelumnya membuang
+keduanya (label dikolapskan jadi header/paragraph, doc.pictures tidak pernah dibaca).
+Sekarang label asli dipakai langsung, gambar/logo halaman pertama ikut jadi blok
+tersendiri, dan baris-baris berdekatan yang senada digabung + blok tanda tangan
+dideteksi via app.parsers.block_grouper (lihat modul itu untuk detail & alasan).
 """
 import time
 from typing import Dict, List, Optional
 
 from app.logger import logger
+from app.parsers.block_grouper import BARE_FORM_LABELS, DraftBlock, process_page_blocks
 from app.parsers.text_cleaner import clean_ocr_text
 from app.schemas.common import (
     AtomicGrounding,
@@ -24,6 +32,44 @@ from app.schemas.common import (
 
 NATIVE_CONFIDENCE = 0.97
 OCR_CONFIDENCE = 0.90
+LOGO_MAX_YMIN = 0.15  # gambar di 15% teratas halaman 1 dianggap logo/letterhead
+
+# Label layout ASLI dari Docling (docling_core.types.doc.labels.DocItemLabel) -> tipe kanonis
+# kita. Sebelumnya kita re-derive tipe dari teks (":" in text -> key_value, dst.) dan
+# membuang informasi layout model yang sebenarnya sudah dihitung Docling secara gratis.
+_DOCLING_LABEL_MAP: Dict[str, str] = {
+    "title": "title",
+    "section_header": "section_header",
+    "caption": "caption",
+    "footnote": "footer",
+    "page_header": "header",
+    "page_footer": "footer",
+    "list_item": "list_item",
+    "picture": "image",
+    "chart": "image",
+    "formula": "paragraph",
+    "code": "paragraph",
+    "text": "paragraph",
+    "paragraph": "paragraph",
+}
+
+
+# Dokumen SPK/PKS sumber sering memisahkan kolom label dan nilai jadi dua item OCR
+# terpisah ("Nama" lalu ": Mohamad Veni Raharja" sebagai item lain) -- kata label
+# polos ini TANPA titik dua, jadi heuristik ":" di bawah tidak menangkapnya, dan ia
+# ikut ke keluarga "paragraph" sehingga bisa tergabung dengan kalimat narasi di
+# dekatnya. Dikenali eksplisit sebagai "key_value" supaya tetap satu keluarga dengan
+# nilainya, dan TIDAK menyatu dengan paragraf naratif yang tidak berkaitan.
+def _classify_label(label: str, text_val: str) -> str:
+    """Label asli Docling jadi acuan utama; heuristik teks cuma penghalus untuk label generik 'text'."""
+    mapped = _DOCLING_LABEL_MAP.get(label, "paragraph")
+    if mapped != "paragraph":
+        return mapped
+    if text_val.strip().lower().rstrip(":") in BARE_FORM_LABELS:
+        return "key_value"
+    if ":" in text_val and len(text_val) < 100:
+        return "key_value"
+    return mapped
 
 
 class DoclingParser:
@@ -39,10 +85,12 @@ class DoclingParser:
             options = PdfPipelineOptions()
             options.do_ocr = do_ocr
             options.do_table_structure = True
+            if do_ocr:
+                options.images_scale = 2.0  # Tingkatkan DPI render citra untuk OCR agar teks halus/miring terbaca
             self._converters[do_ocr] = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
             )
-            logger.info(f"📄 Docling converter dimuat (OCR: {do_ocr}, Table Structure: True)")
+            logger.info(f"📄 Docling converter dimuat (OCR: {do_ocr}, Table Structure: True, Scale: {2.0 if do_ocr else 1.0})")
         return self._converters[do_ocr]
 
     @staticmethod
@@ -75,10 +123,11 @@ class DoclingParser:
         kwargs = {"page_range": (1, max_pages)} if max_pages else {}
         doc = converter.convert(pdf_path, **kwargs).document
 
+        from app.parsers.table_converter import rows_to_markdown_table
         markdown_text = clean_ocr_text(doc.export_to_markdown())
         confidence = OCR_CONFIDENCE if do_ocr else NATIVE_CONFIDENCE
         page_dims: Dict[int, tuple] = {}
-        page_children: Dict[int, List[StructureItem]] = {}
+        page_drafts: Dict[int, List[DraftBlock]] = {}
         search_from = 0
 
         def locate(prov_list):
@@ -89,18 +138,11 @@ class DoclingParser:
             if page_no not in page_dims:
                 page_dims[page_no] = self._get_page_dimensions(doc, page_no)
             bbox = getattr(prov, "bbox", None)
-            return page_no, (self._normalize_bbox(bbox, *page_dims[page_no]) if bbox is not None else None)
+            box = self._normalize_bbox(bbox, *page_dims[page_no]) if bbox is not None else None
+            return page_no, ((box.xmin, box.ymin, box.xmax, box.ymax) if box else None)
 
-        def make_item(elem_type: str, item_id: str, text: str, page_no: int, bbox: Optional[BoundingBox],
-                      start: int, end: int, conf: float) -> StructureItem:
-            box = bbox or BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0)
-            grounding = Grounding(page=page_no, range=TextRange(start=start, end=end), box=box, confidence=conf)
-            return StructureItem(
-                type=elem_type, id=item_id, text=text, grounding=grounding, confidence=conf,
-                atomic_grounding=[AtomicGrounding(page=page_no, range=grounding.range, box=box, text=text, confidence=conf)],
-            )
-
-        for idx, item in enumerate(doc.texts):
+        # 1. Teks: label layout ASLI Docling dipakai langsung (lihat _classify_label).
+        for item in doc.texts:
             text_val = (getattr(item, "text", "") or "").strip()
             if not text_val:
                 continue
@@ -108,54 +150,78 @@ class DoclingParser:
 
             start_pos = markdown_text.find(text_val, max(0, search_from - 50))
             if start_pos == -1:
-                start_pos, end_pos = search_from, search_from  # teks berubah oleh cleaner: range kosong, bukan range palsu
+                start_pos, end_pos = search_from, search_from  # teks berubah oleh cleaner: range kosong, bukan palsu
             else:
                 end_pos = start_pos + len(text_val)
                 search_from = end_pos
 
-            label = str(getattr(item, "label", "text")).lower()
-            if "header" in label or "title" in label:
-                elem_type = "header"
-            elif "list" in label:
-                elem_type = "list_item"
-            elif "footer" in label:
-                elem_type = "footer"
-            elif ":" in text_val and len(text_val) < 100:
-                elem_type = "key_value"
-            else:
-                elem_type = "paragraph"
-            page_children.setdefault(page_no, []).append(
-                make_item(elem_type, f"{elem_type}-{idx}", text_val, page_no, bbox, start_pos, end_pos, confidence)
+            raw_label = str(getattr(item, "label", "text")).lower()
+            elem_type = _classify_label(raw_label, text_val)
+            page_drafts.setdefault(page_no, []).append(
+                DraftBlock(type=elem_type, text=text_val, bbox=bbox, confidence=confidence, start=start_pos, end=end_pos)
             )
 
-        for t_idx, table in enumerate(doc.tables):
+        # 2. Tabel (tidak ikut proses gabung -- satu tabel = satu blok, seperti sebelumnya).
+        for table in doc.tables:
             page_no, bbox = locate(getattr(table, "prov", []))
             try:
                 table_df = table.export_to_dataframe(doc=doc)
-                rows = [" | ".join(str(c) for c in table_df.columns)]
-                rows += [" | ".join(str(v) for v in row) for row in table_df.itertuples(index=False)]
-                table_text = "\n".join(rows)
+                rows = [list(str(c) for c in table_df.columns)]
+                rows += [list(str(v) for v in row) for row in table_df.itertuples(index=False)]
+                table_text = rows_to_markdown_table(rows, has_header=True)
             except Exception:
                 table_text = ""
             if not table_text:
                 continue
-            page_children.setdefault(page_no, []).append(
-                make_item("table", f"table-{t_idx}", table_text[:2000], page_no, bbox, 0, 0, confidence)
+            page_drafts.setdefault(page_no, []).append(
+                DraftBlock(type="table", text=table_text[:3000], bbox=bbox, confidence=confidence, start=0, end=0)
             )
 
-        pages_structure = [
-            StructureItem(
+        # 3. Gambar/logo -- Docling sudah mendeteksinya (doc.pictures) tapi sebelumnya tidak
+        #    pernah dibaca sama sekali. Logo/letterhead biasanya di bagian atas halaman 1.
+        for picture in getattr(doc, "pictures", []):
+            page_no, bbox = locate(getattr(picture, "prov", []))
+            is_logo = page_no == 1 and bbox is not None and bbox[1] <= LOGO_MAX_YMIN
+            page_drafts.setdefault(page_no, []).append(
+                DraftBlock(type="logo" if is_logo else "image", text="", bbox=bbox, confidence=confidence, start=0, end=0)
+            )
+
+        # 4. Gabung baris senada berdekatan, tandai blok attestation (tanda tangan), dan
+        #    urutkan ala urutan baca (bukan cuma ymin -- lihat reading_order_sort untuk
+        #    alasan layout dua kolom seperti blok tanda tangan PIHAK PERTAMA/KEDUA).
+        pages_structure = []
+        for p_no in sorted(page_drafts):
+            processed = process_page_blocks(page_drafts[p_no])
+
+            children: List[StructureItem] = []
+            for idx, draft in enumerate(processed):
+                box = (BoundingBox(xmin=draft.bbox[0], ymin=draft.bbox[1], xmax=draft.bbox[2], ymax=draft.bbox[3])
+                       if draft.bbox else BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0))
+                grounding = Grounding(page=p_no, range=TextRange(start=draft.start or 0, end=draft.end or 0),
+                                      box=box, confidence=draft.confidence)
+                atomic = []
+                for sub in draft.atomic or [draft]:
+                    sub_box = (BoundingBox(xmin=sub.bbox[0], ymin=sub.bbox[1], xmax=sub.bbox[2], ymax=sub.bbox[3])
+                               if sub.bbox else box)
+                    atomic.append(AtomicGrounding(page=p_no, range=TextRange(start=sub.start or 0, end=sub.end or 0),
+                                                  box=sub_box, text=sub.text or None, confidence=sub.confidence))
+                children.append(StructureItem(
+                    type=draft.type, id=f"{draft.type}-p{p_no}-{idx}", text=draft.text or None,
+                    grounding=grounding, confidence=draft.confidence, atomic_grounding=atomic,
+                ))
+
+            pages_structure.append(StructureItem(
                 type="page", id=f"page-{p_no}",
                 grounding=Grounding(page=p_no, range=TextRange(start=0, end=len(markdown_text)),
                                     box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0), confidence=1.0),
-                children=page_children[p_no], confidence=1.0,
-            )
-            for p_no in sorted(page_children)
-        ]
+                children=children, confidence=1.0,
+            ))
 
         duration_ms = int((time.time() - start_time) * 1000)
         engine_name = "ibm-docling" + ("+ocr" if do_ocr else "")
-        logger.info(f"✅ Docling selesai [{engine_name}]: {len(pages_structure)} halaman, {len(markdown_text)} karakter, {duration_ms}ms")
+        block_count = sum(len(p.children) for p in pages_structure)
+        logger.info(f"✅ Docling selesai [{engine_name}]: {len(pages_structure)} halaman, "
+                    f"{block_count} blok (setelah pengelompokan), {len(markdown_text)} karakter, {duration_ms}ms")
         return LandingAIParsedResponse(
             markdown=markdown_text,
             metadata=ParseMetadata(

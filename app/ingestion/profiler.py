@@ -31,6 +31,11 @@ class DocumentProfile:
     scanned_page_ratio: float
     ocr_pages: List[int] = field(default_factory=list)
     pages: List[PageProfile] = field(default_factory=list)
+    # >0 kalau separuh akhir dokumen adalah duplikat persis separuh awal (mis. PDF yang
+    # sama ter-gabung dua kali saat diunggah) -- nilainya jumlah halaman ASLI (separuh).
+    # Ditemukan dari PKS 14 halaman yang isinya 7 halaman diulang persis dua kali,
+    # menyebabkan teks 2x lebih besar dikirim ke LLM tanpa manfaat apa pun.
+    duplicate_block_pages: int = 0
 
     @property
     def needs_ocr(self) -> bool:
@@ -42,16 +47,37 @@ class DocumentProfile:
         return data
 
 
+def _detect_duplicate_block(pages: List[PageProfile], text_hashes: List[int]) -> int:
+    """
+    0 kecuali separuh akhir dokumen adalah duplikat PERSIS separuh awal, halaman demi
+    halaman. Cuma dipercaya kalau halaman-halaman itu punya teks native memadai --
+    dua halaman kosong/scan "cocok" secara trivial (sama-sama string kosong) dan itu
+    bukan duplikasi sungguhan.
+    """
+    n = len(pages)
+    if n < 2 or n % 2 != 0:
+        return 0
+    half = n // 2
+    if text_hashes[:half] != text_hashes[half:]:
+        return 0
+    if any(p.native_chars < config.PAGE_NATIVE_MIN_CHARS for p in pages[:half]):
+        return 0
+    return half
+
+
 def profile_document(pdf_path: str, max_pages: int = None) -> DocumentProfile:
     import pymupdf as fitz
 
     min_chars = config.PAGE_NATIVE_MIN_CHARS
     pages: List[PageProfile] = []
+    text_hashes: List[int] = []
     with fitz.open(pdf_path) as doc:
         limit = min(len(doc), max_pages) if max_pages else len(doc)
         for idx in range(limit):
             page = doc[idx]
-            chars = len(page.get_text("text").strip())
+            text = page.get_text("text").strip()
+            chars = len(text)
+            text_hashes.append(hash(text))
             area = max(page.rect.width * page.rect.height, 1.0)
             image_area = 0.0
             for info in page.get_image_info():
@@ -74,4 +100,5 @@ def profile_document(pdf_path: str, max_pages: int = None) -> DocumentProfile:
         scanned_page_ratio=round(scanned_ratio, 3),
         ocr_pages=ocr_pages,
         pages=pages,
+        duplicate_block_pages=_detect_duplicate_block(pages, text_hashes),
     )

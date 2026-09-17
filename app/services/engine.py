@@ -23,6 +23,7 @@ from app.extractors.prompts import PROMPT_VERSION
 from app.ingestion.profiler import DocumentProfile, profile_document
 from app.logger import logger
 from app.schemas.common import BoundingBox, FieldVisualGrounding, LandingAIParsedResponse
+from app.schemas.bast import BASTExtractionSchema
 from app.schemas.contract import ContractExtractionSchema
 from app.schemas.evidence import FieldEvidence, FieldStatus, ValidationReport
 from app.schemas.sph import SPHExtractionSchema
@@ -32,6 +33,7 @@ from app.validation.rules import RULE_VERSION, validate_extraction
 MIN_CHARS_PER_PAGE_AFTER_OCR = 50
 CONTRACT_TYPES = {"contract", "spk", "perjanjian"}
 SPH_TYPES = {"sph", "penawaran", "quote"}
+BAST_TYPES = {"bast"}
 
 
 class ParsingError(Exception):
@@ -49,6 +51,7 @@ class OpenADEEngine:
         self._docling = None
         self._paddle = None
         self._extractor = None
+        self._refiner = None
         self.classifier = DocumentClassifier()
 
     @property
@@ -72,6 +75,13 @@ class OpenADEEngine:
             self._extractor = OllamaExtractor()
         return self._extractor
 
+    @property
+    def refiner(self):
+        if self._refiner is None:
+            from app.parsers.markdown_refiner import MarkdownRefiner
+            self._refiner = MarkdownRefiner()
+        return self._refiner
+
     # ------------------------------------------------------------------ stage 1: parse
     def profile(self, pdf_path: str, max_pages: int = None) -> Optional[DocumentProfile]:
         try:
@@ -80,7 +90,7 @@ class OpenADEEngine:
             logger.warning(f"⚠️  Profiling gagal ({e}); dokumen diperlakukan sebagai non-PDF")
             return None
 
-    def parse(self, pdf_path: str, max_pages: int = None, parser: str = "auto",
+    def parse(self, pdf_path: str, max_pages: int = None, parser: Optional[str] = None,
               profile: Optional[DocumentProfile] = None) -> LandingAIParsedResponse:
         path = Path(pdf_path)
         if not path.exists():
@@ -93,7 +103,7 @@ class OpenADEEngine:
         else:
             needs_ocr = path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
-        choice = parser.lower()
+        choice = (parser or config.DEFAULT_PARSER).lower()
         started = time.time()
         if choice == "paddle":
             parsed = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
@@ -111,6 +121,13 @@ class OpenADEEngine:
                 if choice == "auto" and needs_ocr and too_little:
                     logger.info("ℹ️  Output OCR Docling terlalu sedikit → PaddleOCR")
                     parsed = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
+
+        # Poles teks markdown (reparasi typo / teks rumpang OCR & format tabel LaTeX-grade)
+        if config.ENABLE_LLM_MARKDOWN_REFINER:
+            refined_md = self.refiner.refine_markdown(parsed.markdown)
+            if refined_md and refined_md != parsed.markdown:
+                parsed.markdown = refined_md
+                parsed.metadata.output_markdown_chars = len(refined_md)
 
         logger.info(f"✅ Parsing [{parsed.metadata.parser_engine}]: {parsed.metadata.page_count} hlm | "
                     f"{parsed.metadata.output_markdown_chars} karakter | {time.time() - started:.1f}s")
@@ -132,7 +149,7 @@ class OpenADEEngine:
             )
 
     # ------------------------------------------------------------------ stage 2: extract
-    def extract(self, markdown_text: str, doc_type: str = "auto") -> Tuple[Union[ContractExtractionSchema, SPHExtractionSchema], str]:
+    def extract(self, markdown_text: str, doc_type: str = "auto") -> Tuple[Union[ContractExtractionSchema, SPHExtractionSchema, BASTExtractionSchema], str]:
         resolved = doc_type.lower()
         if resolved == "auto":
             classification = self.classifier.classify(markdown_text)
@@ -144,6 +161,8 @@ class OpenADEEngine:
         try:
             if resolved in SPH_TYPES:
                 extracted, resolved = self.extractor.extract_sph(markdown_text), "sph"
+            elif resolved in BAST_TYPES:
+                extracted, resolved = self.extractor.extract_bast(markdown_text), "bast"
             else:
                 if resolved not in CONTRACT_TYPES:
                     logger.warning(f"⚠️  Belum ada schema untuk tipe '{resolved}', memakai schema kontrak")
@@ -200,7 +219,7 @@ class OpenADEEngine:
 
     # ------------------------------------------------------------------ end-to-end
     def process_full(self, pdf_path: str, doc_type: str = "auto", output_dir: str = None,
-                     max_pages: int = None, parser: str = "auto") -> Dict[str, Any]:
+                     max_pages: int = None, parser: Optional[str] = None) -> Dict[str, Any]:
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         timings: Dict[str, float] = {}
         t0 = time.time()
@@ -221,7 +240,14 @@ class OpenADEEngine:
         parse_md_file = parsing_dir / f"{path.stem}.parse.md"
         parse_json_file = parsing_dir / f"{path.stem}.parse.json"
         parse_md_file.write_text(parsed.markdown, encoding="utf-8")
-        parse_json_file.write_text(json.dumps(parsed.model_dump(exclude_none=True), ensure_ascii=False), encoding="utf-8")
+        # indent=2 supaya struktur (halaman/blok bertingkat) enak dibuka langsung di editor --
+        # sebelumnya satu baris raksasa, tidak elok dibuka manual. "markdown" dikeluarkan dari
+        # file JSON ini: isinya sama persis dengan *.parse.md di sebelahnya (yang memang teks
+        # biasa, bukan string ber-escape \n), jadi dobel di sini cuma menambah ukuran file dan
+        # bikin satu field muncul sebagai satu baris sangat panjang tanpa cara dihindari (aturan
+        # format JSON: newline di dalam string wajib di-escape jadi \n literal).
+        parse_json_data = parsed.model_dump(exclude_none=True, exclude={"markdown"})
+        parse_json_file.write_text(json.dumps(parse_json_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
         ir: DocumentIR = from_parsed_response(parsed, file_name=path.name)
         self.ensure_enough_text(parsed)

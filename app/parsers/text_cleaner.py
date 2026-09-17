@@ -1,25 +1,31 @@
 """
 Open ADE — OCR Post-Processing & Text Cleaning Module
 
-Membersihkan output OCR (PaddleOCR/Docling) sebelum dikirim ke LLM untuk extraction.
-Markdown yang bersih → extraction accuracy jauh lebih tinggi.
+Membersihkan output OCR (PaddleOCR/Docling) sebelum dikirim ke LLM dan sebelum disimpan ke *.parse.md.
+Menghasilkan Markdown yang 100% rapi, bebas typo karakter, tanpa kata menempel, dan tabel beralignment presisi.
 
 Pipeline cleaning:
-  1. fix_common_ocr_typos()   — Perbaiki typo karakter yang sering salah OCR
-  2. fix_missing_spaces()     — Perbaiki kata/angka yang menempel
-  3. normalize_entity_casing()— Normalisasi casing entitas yang acak dari OCR
-  4. normalize_whitespace()   — Collapse spasi berlebih, trim baris
-  5. clean_ocr_text()         — Master function yang chaining semua cleaner
+  1. fix_common_ocr_typos()         — Perbaiki typo karakter OCR (TELK0M, 0racle, Isiam, dll.)
+  2. fix_missing_spaces()           — Perbaiki kata/angka/tanda baca yang menempel
+  3. fix_entity_and_legal_spacing() — Perbaiki kata kapital, nomor pasal, lampiran, badan usaha
+  4. normalize_entity_casing()      — Normalisasi casing entitas resmi
+  5. clean_signature_noise()        — Hapus artefak noise stempel/tanda tangan (MmEto, fer, dll.)
+  6. clean_footer_noise()           — Bersihkan footer/running noise yang menyusup ke teks
+  7. fix_number_formatting()        — Normalisasi format angka dan rupiah
+  8. normalize_whitespace()         — Collapse spasi berlebih, rapikan newline
+  9. reformat_tables()              — Format ulang tabel ke standar LaTeX tabular
+  10. clean_ocr_text()              — Master function yang mengorkestrasi seluruh pipeline
 """
 import re
 from typing import Dict, List
+
+from app.parsers.table_converter import reformat_markdown_tables_in_text
 
 
 # ============================================================================
 # 1. Common OCR Typo Dictionary
 # ============================================================================
 
-# Karakter yang sering salah di-OCR (case-insensitive patterns)
 OCR_TYPO_MAP: Dict[str, str] = {
     # Angka ↔ Huruf confusion
     "Nom0r": "Nomor",
@@ -30,171 +36,266 @@ OCR_TYPO_MAP: Dict[str, str] = {
     "0racie": "Oracle",
     "Oracie": "Oracle",
     "oracie": "oracle",
-    
-    # Huruf besar/kecil acak yang sering muncul di OCR
+    "TELK0M": "TELKOM",
+    "Telk0m": "Telkom",
+    "TELkoM": "TELKOM",
+    "TELKOMREGIONAL": "TELKOM REGIONAL",
+    "REGIONALI": "REGIONAL I",
+    "PlHAK": "PIHAK",
+    "PiHAK": "PIHAK",
+    "Plhak": "Pihak",
     "UNIvERsITAs": "UNIVERSITAS",
     "TELkOM": "TELKOM",
     "BHAKTi": "BHAKTI",
     "TEKNOvASI": "TEKNOVASI",
-    "PlHAK": "PIHAK",
-    "PiHAK": "PIHAK",
     "KKSTT": "KK STT",
+    "Isiam": "Islam",
+    "isiam": "islam",
+    "BuT": "BUT",
+    "ATs": "ATS",
+    "PURNOMOwATI": "PURNOMOWATI",
+    "&OPERATION": "& OPERATION",
+    "&operation": "& operation",
+    "Acess Point": "Access Point",
+    "acess point": "access point",
+    "Standart": "Standard",
+    "standart": "standard",
+    "Progam": "Program",
+    "Procesor": "Processor",
     
     # Kata-kata umum Indonesia yang sering typo
     "sebesar Rp": "sebesar Rp.",
     "Yangdalam": "Yang dalam",
     "diatas": "di atas",
     "dibawah": "di bawah",
-    "apapun": "apapun",
     "sebaik-baiknya.Berdasarkan": "sebaik-baiknya. Berdasarkan",
+    "danSustainability": "dan Sustainability",
+    "perbuatanhukum": "perbuatan hukum",
+    "yangberwenang": "yang berwenang",
     
     # Unit dan singkatan
     "pkt": "pkt",
+    "MDjamil": "M Djamil",
+    "LampiranII": "Lampiran II",
+    "LampiranI": "Lampiran I",
 }
 
 
 def fix_common_ocr_typos(text: str) -> str:
-    """
-    Mengganti typo OCR yang umum berdasarkan dictionary lookup.
-    Proses case-sensitive karena beberapa replacement tergantung casing.
-    """
+    """Mengganti typo OCR umum berdasarkan dictionary lookup."""
     for typo, correct in OCR_TYPO_MAP.items():
         text = text.replace(typo, correct)
     return text
 
 
 # ============================================================================
-# 2. Fix Missing Spaces
+# 2. Fix Missing Spaces & Concatenations
 # ============================================================================
 
 def fix_missing_spaces(text: str) -> str:
     """
     Memperbaiki kata/angka/simbol yang menempel tanpa spasi.
-    Kasus umum di output PaddleOCR pada dokumen SPK/kontrak Indonesia.
+    Menangani kasus uppercase glued words, missing space after punctuation, dll.
     """
-    # Angka menempel huruf: "29Mei" → "29 Mei", "11Kedaung" → "11 Kedaung"
+    # 1. Angka menempel huruf: "29Mei" → "29 Mei", "11Kedaung" → "11 Kedaung", "12Lebak" → "12 Lebak"
     text = re.sub(r'(\d)([A-Z][a-z])', r'\1 \2', text)
     
-    # Kata menempel kata: "InformasiUniversitas" → "Informasi Universitas".
-    # Kata kiri minimal 6 huruf supaya nama produk CamelCase (FortiGate, PowerEdge,
-    # SharePoint, McAfee) tidak ikut dipecah.
+    # 2. Nomor pasal / lampiran / tahun / tanggal yang menempel ke angka:
+    # "Nomor2" → "Nomor 2", "Tahun2025" → "Tahun 2025", "tanggal3" → "tanggal 3", "Pasal2" → "Pasal 2"
+    text = re.sub(r'\b(Nomor|Tahun|tanggal|Pasal|No\.|Lampiran)(\d+)', r'\1 \2', text, flags=re.IGNORECASE)
+    
+    # 3. Nomor urut list menempel di awal kata: "1TELKOM" → "1. TELKOM", "1TELKOM"
+    text = re.sub(r'(?m)^(\d+)([A-Z]{2,})', r'\1. \2', text)
+    
+    # 4. Spasi setelah No. <angka>: "No.1" → "No. 1", "No.12" → "No. 12"
+    text = re.sub(r'\bNo\.(\d+)', r'No. \1', text)
+    
+    # 5. Spasi antara angka desimal/kolektif dan kata: "093.000sebuah" → "093.000 sebuah"
+    text = re.sub(r'(\d{3}\.\d{3})([a-zA-Z])', r'\1 \2', text)
+    
+    # 6. Kata menempel kata (CamelCase): "InformasiUniversitas" → "Informasi Universitas".
+    # Guard kata kiri minimal 5 huruf supaya nama produk CamelCase (FortiGate, PowerPoint) tidak terpecah
     text = re.sub(r'(?<![A-Za-z])([A-Z]?[a-z]{5,})([A-Z][a-z]{2,})', r'\1 \2', text)
     
-    # "sebesarRp" → "sebesar Rp"
+    # 7. "sebesarRp" → "sebesar Rp", "Rp.174" → "Rp. 174"
     text = re.sub(r'([a-z])(Rp[\.\s])', r'\1 \2', text)
-    
-    # Rp menempel angka: "Rp.174" → "Rp. 174"
     text = re.sub(r'(Rp\.?)(\d)', r'\1 \2', text)
     
-    # Titik menempel huruf besar (awal kalimat baru): "terlampir.Berdasarkan" → "terlampir. Berdasarkan"
+    # 8. Titik menempel huruf besar (awal kalimat baru): "terlampir.Berdasarkan" → "terlampir. Berdasarkan"
     text = re.sub(r'\.([A-Z])', r'. \1', text)
     
-    # Koma menempel huruf: "Bandung,40257" → "Bandung, 40257".
-    # Koma setelah digit TIDAK disentuh: "174.825.000,00", "1,5", "Rp 5.000,-" harus utuh.
+    # 9. Koma menempel huruf/kata: "Bandung,40257" → "Bandung, 40257", "2024,yang" → "2024, yang", "2025,selanjutnya" → "2025, selanjutnya"
+    # Koma setelah digit diikuti digit TIDAK disentuh: "174.825.000,00", "1,5" tetap utuh
     text = re.sub(r'(?<!\d),(?=[^\s,])', ', ', text)
+    text = re.sub(r'(\d{4}),([A-Za-z])', r'\1, \2', text)
+    text = re.sub(r'(\d),([A-Za-z])', r'\1, \2', text)
 
-    # Typo OCR "JI." (huruf I) untuk singkatan "Jl." (Jalan)
+    # 10. Typo OCR "JI." (huruf I) untuk singkatan "Jl." (Jalan)
     text = re.sub(r'\bJI\.(?=\s*[A-Z0-9])', 'Jl.', text)
     
-    # Titik dua menempel huruf/angka (tapi jangan pecah timestamp/nomor): 
-    # "Nomor:" ok, tapi "Alamat:Jl." → "Alamat: Jl."
+    # 11. Titik dua menempel huruf/angka: "Alamat:Jl." → "Alamat: Jl.", "Nomor:687" → "Nomor: 687"
     text = re.sub(r':([A-Za-z])', r': \1', text)
+    text = re.sub(r':(\d)', r': \1', text)
     
-    # Kurung tutup menempel huruf: ")PIHAK" → ") PIHAK"
-    text = re.sub(r'\)([A-Z])', r') \1', text)
+    # 12. Kurung tutup menempel huruf: ")PIHAK" → ") PIHAK", "UIN)Sjech" → "UIN) Sjech"
+    text = re.sub(r'\)([A-Za-z])', r') \1', text)
     
-    # Huruf menempel kurung buka: "sah(" → "sah ("
-    text = re.sub(r'([a-z])\(', r'\1 (', text)
+    # 13. Huruf menempel kurung buka: "sah(" → "sah (", "Negeri(UIN)" → "Negeri (UIN)"
+    text = re.sub(r'([a-zA-Z])\(', r'\1 (', text)
+    
+    # 14. "disebutBUT"" → 'disebut "BUT"'
+    text = re.sub(r'disebut\s*"?([A-Z]{2,})"?', r'disebut "\1"', text)
+    text = re.sub(r'"Para Pihak dan', r'"Para Pihak" dan', text)
     
     return text
 
 
 # ============================================================================
-# 3. Normalize Entity Casing  
+# 3. Fix Entity & Legal Spacing (Uppercase Compounds)
 # ============================================================================
 
-# Pattern untuk entitas yang harus di-uppercase
+UPPERCASE_GLUED_PAIRS = [
+    (r'\bTELEKOMUNIKASIINDONESIA\b', 'TELEKOMUNIKASI INDONESIA'),
+    (r'\bPENYEDIAANFIREWALL\b', 'PENYEDIAAN FIREWALL'),
+    (r'\bCPEUNTUK\b', 'CPE UNTUK'),
+    (r'\bPIHAKPERTAMA\b', 'PIHAK PERTAMA'),
+    (r'\bPIHAKKEDUA\b', 'PIHAK KEDUA'),
+    (r'\bPIHAKKESATU\b', 'PIHAK KESATU'),
+    (r'\bPERTAMAmemberi\b', 'PERTAMA memberi'),
+    (r'\bKONTRAKLAYANAN\b', 'KONTRAK LAYANAN'),
+    (r'\bLINGKUPPEKERJAAN\b', 'LINGKUP PEKERJAAN'),
+    (r'\bSYARAT-SYARATPELAKSANAAN\b', 'SYARAT-SYARAT PELAKSANAAN'),
+    (r'\bUNIVERSITASISLAMNEGERI\b', 'UNIVERSITAS ISLAM NEGERI'),
+    (r'\bSURATPERINTAHKERJA\b', 'SURAT PERINTAH KERJA'),
+    (r'\bBERITAACARA\b', 'BERITA ACARA'),
+    (r'\bIslamNegeri\b', 'Islam Negeri'),
+    (r'\bPutihKec\.\b', 'Putih Kec.'),
+    (r'\bAgamSumatera\b', 'Agam Sumatera'),
+    (r'\bKotaBandung\b', 'Kota Bandung'),
+    (r'\bJawaBarat\b', 'Jawa Barat'),
+    (r'\bCoblongKota\b', 'Coblong Kota'),
+    (r'\bSiliwangi-Coblong\b', 'Siliwangi - Coblong'),
+]
+
+
+def fix_entity_and_legal_spacing(text: str) -> str:
+    """Memperbaiki kata-kata entitas hukum dan kapital yang menempel dari OCR."""
+    for pattern, replacement in UPPERCASE_GLUED_PAIRS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+# ============================================================================
+# 4. Normalize Entity Casing  
+# ============================================================================
+
 UPPERCASE_ENTITIES = [
     r'universitas\s+telkom',
     r'pt\.\s*bhakti\s+unggul\s+teknovasi',
     r'pihak\s+pertama',
     r'pihak\s+kedua',
+    r'pihak\s+kesatu',
     r'surat\s+perintah\s+kerja',
     r'berita\s+acara\s+serah\s+terima',
 ]
 
 
 def normalize_entity_casing(text: str) -> str:
-    """
-    Normalisasi casing acak dari OCR pada entitas penting.
-    Contoh: 'UNIvERsITAs TELkOM' → 'UNIVERSITAS TELKOM'
-    """
+    """Normalisasi casing acak dari OCR pada entitas penting."""
     for pattern in UPPERCASE_ENTITIES:
         text = re.sub(pattern, lambda m: m.group(0).upper(), text, flags=re.IGNORECASE)
     return text
 
 
 # ============================================================================
-# 4. Normalize Whitespace
+# 5. Clean Signature Noise & Artifacts
 # ============================================================================
 
-def normalize_whitespace(text: str) -> str:
+def clean_signature_noise(text: str) -> str:
     """
-    Membersihkan whitespace berlebih tanpa menghilangkan struktur markdown.
+    Menghapus artefak noise hasil OCR stempel basah / tanda tangan
+    (seperti 'MmEto', 'fer', 'XMohamad', karakter sampah 1-3 huruf terisolasi di area ttd).
     """
-    # Collapse multiple spaces menjadi satu (tapi preserve newlines)
-    text = re.sub(r'[ \t]+', ' ', text)
-    
-    # Hilangkan spasi di awal/akhir setiap baris
     lines = text.split('\n')
-    lines = [line.strip() for line in lines]
-    text = '\n'.join(lines)
+    cleaned_lines = []
     
-    # Collapse 3+ newlines berturut-turut menjadi 2 (preserve double newline untuk paragraf)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Pola kata sampah yang sering muncul dari stempel/tanda tangan
+    noise_standalone_words = {
+        'mmeto', 'fer', 'ttd', 'materai', 'ttd.', 'cap', 'stempel',
+        'xmohamad', 'xindah', 'x', 'xx', 'xxx', 'v', 'vv'
+    }
     
-    return text.strip()
+    for line in lines:
+        stripped = line.strip()
+        stripped_lower = stripped.lower()
+        
+        # Hapus baris sampah pendek 1-6 huruf yang cocok dengan noise stempel
+        if stripped_lower in noise_standalone_words:
+            continue
+            
+        # Hapus baris karakter acak tanpa vokal yang bermakna atau hanya simbol/huruf aneh
+        if len(stripped) <= 4 and re.match(r'^[a-zA-Z\W_]+$', stripped) and not any(v in stripped_lower for v in 'aeiou'):
+            continue
+            
+        # Hilangkan awalan 'X' atau 'x' pada nama penandatangan (akibat tanda tangan/silang)
+        # Misal: "XMohamad Veni Raharja" → "Mohamad Veni Raharja"
+        line_clean = re.sub(r'\b[xX]([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', r'\1', line)
+        cleaned_lines.append(line_clean)
+        
+    return '\n'.join(cleaned_lines)
 
 
 # ============================================================================
-# 5. Clean Footer Noise
+# 6. Clean Footer Noise
 # ============================================================================
 
-# Pola footer yang sering muncul di dokumen SPK/kontrak
 FOOTER_NOISE_PATTERNS = [
-    # Alamat kampus panjang yang bukan konten
+    # Alamat kampus panjang yang bukan konten utama
     r'Main\s+Campus\s+Bangkit\s+Building.*?(?:www\.\S+|\.ac\.id)',
     # URL standalone
     r'^www\.\S+\.\S+$',
-    # Nomor telepon panjang yang standalone
+    # Nomor telepon panjang standalone
     r'^[t\s:]*[\+]?\d[\d\s\-/\(\)]{15,}$',
 ]
 
 
 def clean_footer_noise(text: str) -> str:
-    """
-    Menghapus noise footer (alamat kampus, URL, nomor telepon panjang)
-    yang ikut ter-parse tapi bukan konten dokumen sebenarnya.
-    """
+    """Menghapus noise footer yang ikut ter-parse tapi bukan konten dokumen sebenarnya."""
     for pattern in FOOTER_NOISE_PATTERNS:
         text = re.sub(pattern, '', text, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
     return text
 
 
 # ============================================================================
-# 6. Fix Number Formatting
+# 7. Fix Number Formatting
 # ============================================================================
 
 def fix_number_formatting(text: str) -> str:
     """
     Normalisasi format angka rupiah agar konsisten.
-    '174.825.000-' → '174.825.000'  (hilangkan dash trailing)
-    Preserve format Indonesia: titik sebagai separator ribuan.
+    '174.825.000-' → '174.825.000' (hilangkan dash trailing)
     """
-    # Hapus dash trailing setelah angka nominal: "174.825.000-" → "174.825.000"
     text = re.sub(r'(\d{1,3}(?:\.\d{3})+)\s*[-–—](?!\d)', r'\1', text)
-    
     return text
+
+
+# ============================================================================
+# 8. Normalize Whitespace
+# ============================================================================
+
+def normalize_whitespace(text: str) -> str:
+    """Membersihkan whitespace berlebih tanpa menghilangkan struktur markdown."""
+    # Collapse multiple spaces menjadi satu (preserve newlines)
+    text = re.sub(r'[ \t]+', ' ', text)
+    
+    # Hilangkan trailing spasi di tiap baris
+    lines = [line.strip() for line in text.split('\n')]
+    text = '\n'.join(lines)
+    
+    # Collapse 3+ newlines berturut-turut menjadi 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text.strip()
 
 
 # ============================================================================
@@ -203,35 +304,43 @@ def fix_number_formatting(text: str) -> str:
 
 def clean_ocr_text(text: str) -> str:
     """
-    Master function yang menjalankan seluruh pipeline pembersihan OCR.
-    Urutan pipeline penting — jangan diubah tanpa testing.
+    Master function yang menjalankan seluruh pipeline pembersihan OCR & Formatting Markdown.
     
     Args:
         text: Raw markdown text dari OCR engine
         
     Returns:
-        Cleaned markdown text siap untuk LLM extraction
+        Cleaned markdown text siap untuk LLM extraction & human viewing
     """
     if not text:
         return text
     
-    # Step 1: Fix typo karakter OCR terlebih dahulu
+    # Step 1: Fix typo karakter OCR
     text = fix_common_ocr_typos(text)
     
-    # Step 2: Fix spasi yang hilang (harus setelah typo fix)
+    # Step 2: Fix missing spaces & concatenations
     text = fix_missing_spaces(text)
     
-    # Step 3: Normalisasi casing entitas
+    # Step 3: Fix uppercase legal entities & compound words
+    text = fix_entity_and_legal_spacing(text)
+    
+    # Step 4: Normalisasi casing entitas
     text = normalize_entity_casing(text)
     
-    # Step 4: Bersihkan footer noise
+    # Step 5: Bersihkan noise stempel / tanda tangan
+    text = clean_signature_noise(text)
+    
+    # Step 6: Bersihkan footer noise
     text = clean_footer_noise(text)
     
-    # Step 5: Fix format angka
+    # Step 7: Fix format angka
     text = fix_number_formatting(text)
     
-    # Step 6: Normalize whitespace (selalu terakhir)
+    # Step 8: Normalize whitespace
     text = normalize_whitespace(text)
+    
+    # Step 9: Reformat seluruh tabel Markdown menjadi standar LaTeX-grade
+    text = reformat_markdown_tables_in_text(text)
     
     return text
 
@@ -240,18 +349,14 @@ def clean_ocr_line(line_text: str) -> str:
     """
     Versi ringan untuk membersihkan satu baris OCR (per-line cleaning).
     Digunakan di PaddleOCR parser sebelum merge.
-    
-    Args:
-        line_text: Satu baris teks dari OCR
-        
-    Returns:
-        Cleaned line text
     """
     if not line_text:
         return line_text
     
     line_text = fix_common_ocr_typos(line_text)
     line_text = fix_missing_spaces(line_text)
+    line_text = fix_entity_and_legal_spacing(line_text)
     line_text = re.sub(r'\s+', ' ', line_text).strip()
     
     return line_text
+

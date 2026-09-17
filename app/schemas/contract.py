@@ -2,11 +2,16 @@ from typing import List, Optional, Union, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict
 
 class PihakDetail(BaseModel):
+    """
+    nama_representative/jabatan/alamat dibuat Optional: dokumen ringkas (Nota Pesanan,
+    PKS tanpa blok tanda tangan formal) sering tidak mencantumkannya. Wajib null jika
+    tidak ada di teks -- bukan dikarang oleh LLM.
+    """
     model_config = ConfigDict(populate_by_name=True)
     nama_perusahaan: str = Field(..., alias="Nama Perusahaan", description="Nama institusi atau perusahaan yang diwakili")
-    nama_representative: str = Field(..., alias="Nama Representative", description="Nama pejabat atau pihak yang menandatangani")
-    jabatan: str = Field(..., alias="Jabatan", description="Jabatan pejabat terkait")
-    alamat: str = Field(..., alias="Alamat", description="Alamat lengkap domisili instansi/perusahaan")
+    nama_representative: Optional[str] = Field(None, alias="Nama Representative", description="Nama pejabat atau pihak yang menandatangani, jika disebutkan")
+    jabatan: Optional[str] = Field(None, alias="Jabatan", description="Jabatan pejabat terkait, jika disebutkan")
+    alamat: Optional[str] = Field(None, alias="Alamat", description="Alamat lengkap domisili instansi/perusahaan, jika disebutkan")
 
 class ItemBarangPekerjaan(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -37,9 +42,9 @@ class ContractExtractionSchema(BaseModel):
     
     items: List[ItemBarangPekerjaan] = Field(..., alias="List Item/Barang", description="Daftar rincian lengkap seluruh baris tabel barang, jasa, atau BoQ")
     
-    nomor_kontrak: str = Field(..., alias="Nomor Kontrak Kerja", description="Nomor resmi Surat Perintah Kerja / Kontrak")
+    nomor_kontrak: Optional[str] = Field(None, alias="Nomor Kontrak Kerja", description="Nomor resmi SPK / Kontrak / PKS / Nota Pesanan, jika ada")
     tanggal_negosiasi: Optional[str] = Field(None, alias="Tanggal Negosiasi", description="Tanggal dilakukannya negosiasi harga (format: YYYY-MM-DD atau teks asli)")
-    nama_pekerjaan: str = Field(..., alias="Nama Pekerjaan", description="Judul atau lingkup pengadaan pekerjaan")
+    nama_pekerjaan: Optional[str] = Field(None, alias="Nama Pekerjaan", description="Judul atau lingkup pengadaan pekerjaan, jika disebutkan")
     
     persentase_ppn: Optional[str] = Field("11%", alias="persentase ppn", description="Persentase PPN yang berlaku")
     jangka_waktu: Optional[str] = Field(None, alias="Jangka Waktu", description="Rentang tanggal pelaksanaan (misal: 29 Mei 2026 - 29 Mei 2027)")
@@ -60,9 +65,9 @@ class ContractExtractionSchema(BaseModel):
     lokasi: Optional[str] = Field(None, alias="Lokasi", description="Kota atau lokasi pembuatan/pelaksanaan dokumen (misal: Bandung)")
     tanggal_pembuatan_dokumen: Optional[str] = Field(None, alias="Tanggal Pembuatan Dokumen", description="Tanggal penandatanganan SPK / Kontrak (misal: 2026-06-02)")
     
-    sub_total: float = Field(..., alias="sub total", description="Total harga sebelum pajak")
+    sub_total: Optional[float] = Field(None, alias="sub total", description="Total harga sebelum pajak, jika dokumen memisahkannya dari total")
     total_ppn: Optional[float] = Field(0.0, alias="Total PPN", description="Nominal PPN dalam Rupiah")
-    total_harga_pekerjaan: float = Field(..., alias="Total Harga Pekerjaan", description="Total nilai kontrak termasuk pajak")
+    total_harga_pekerjaan: Optional[float] = Field(None, alias="Total Harga Pekerjaan", description="Total nilai kontrak/pesanan termasuk pajak")
     jumlah_terbilang: Optional[str] = Field(None, alias="Jumlah Terbilang", description="Nominal rupiah yang ditulis dalam kata-kata")
     
     garansi: Optional[str] = Field(None, alias="Garansi", description="Klausul garansi atau SLA")

@@ -63,6 +63,11 @@ _ADDRESS_KEYWORDS = ['jl.', 'jl ', 'ji.', 'jln', 'jalan', 'kampus', 'gedung', 'k
                      'lantai', 'blok', 'rt/rw', 'rt.', 'kel.', 'kelurahan', 'kec.', 'kecamatan', 'kota ', 'kabupaten']
 _BANK_STOP = r'(?!(?i:cabang|kcp|kc|unit|no|nomor|rekening|dengan|sebesar|atas)\b|a\.n)'
 
+# "Pihak Kesatu" adalah sinonim resmi "Pihak Pertama" yang umum dipakai di dokumen
+# Perjanjian Kerja Sama (PKS). Beberapa dokumen juga memakai "Pihak Ke-1"/"Pihak Ke-2".
+_FIRST_PARTY_LABEL = r'PIHAK\s+(?:PERTAMA|KESATU|KE-?\s*1)'
+_SECOND_PARTY_LABEL = r'PIHAK\s+(?:KEDUA|KE-?\s*2)'
+
 
 class ContextAnalyzer:
     SECTION_PATTERNS = [
@@ -152,9 +157,49 @@ class ContextAnalyzer:
             if m and len(re.sub(r'\b(?:pt|cv)\b\.?', '', m.group(1), flags=re.IGNORECASE).strip()) >= 4:
                 put(self._entity(text, 'Nama Rekening Bank', m.group(1), w_start + m.start()))
 
-        m = re.search(r'negosiasi\s+(?:harga\s+)?(?:pada\s+)?(?:tanggal\s+)?(\d{1,2}\s+[A-Za-z]+\s+\d{4})', text, re.IGNORECASE)
-        if m:
-            put(self._entity(text, 'Tanggal Negosiasi', m.group(1), m.start(), 0.85))
+        # --- Nomor Kontrak / SPK / Dokumen
+        contract_patterns = [
+            r'(?:Nomor\s+Kontrak(?:\s+Kerja)?|Nomor\s+SPK|No\.?\s*SPK|Nomor\s+PKS|No\.?\s*PKS)\s*:?\s*([A-Za-z0-9\.\-\/_]+)',
+            r'(?:^|\n)\s*(?:##\s*)?(?:SURAT\s+PERINTAH\s+KERJA|KONTRAK\s+LAYANAN|PERJANJIAN\s+KERJA\s+SAMA)[\s\S]{0,120}?(?:Nomor|No\.?)\s*:?\s*([A-Za-z0-9\.\-\/_]+(?:[ \t]*\/[ \t]*[A-Za-z0-9\.\-\/_]+)*)',
+            r'(?:^|\n)\s*Nomor\s*:?\s*([A-Za-z0-9\.\-\/_]{5,})',
+        ]
+        for cp in contract_patterns:
+            m_cp = re.search(cp, text, re.IGNORECASE)
+            if m_cp:
+                val = m_cp.group(1).strip()
+                if len(val) >= 4 and not val.lower().startswith(('rekening', 'telepon', 'npwp', 'akta')):
+                    put(self._entity(text, 'Nomor Kontrak Kerja', val, m_cp.start(), 0.85))
+                    break
+
+        # --- Tanggal Negosiasi: mencari konsiderans negosiasi/kesepakatan harga
+        m_neg = re.search(
+            r'(?:negosiasi\s+harga|kesepakatan\s+harga|klarifikasi\s+dan\s+negosiasi|berita\s+acara\s+negosiasi)[\s\S]{0,40}?'
+            r'(?:pada\s+)?(?:tanggal|tgl\.?)\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2})',
+            text, re.IGNORECASE
+        )
+        if not m_neg:
+            m_neg = re.search(r'negosiasi\s+(?:harga\s+)?(?:pada\s+)?(?:tanggal\s+)?(\d{1,2}\s+[A-Za-z]+\s+\d{4})', text, re.IGNORECASE)
+        if m_neg:
+            put(self._entity(text, 'Tanggal Negosiasi', m_neg.group(1), m_neg.start(), 0.85))
+
+        # --- Nama Pekerjaan: mendeteksi judul/lingkup pengadaan dari frasa standar dokumen
+        job_patterns = [
+            r'Nama\s+Pekerjaan\s*:?\s*([^\n]+)',
+            r'memberi\s+perintah\s+kerja\s+([\s\S]+?)\s+(?:kepada\s*:|dengan\s+uraian|\s+sesuai)',
+            r'(?:tentang|perihal|mengenai)\s+([\s\S]+?)(?:\s+maka\s+kami|\s+antara|\s+nomor|\n\n|$)',
+            r'Jumlah\s+harga\s+untuk\s+([\s\S]+?)\s+sebesar\s+Rp',
+            r'(?:^|\n)\s*Lampiran\s*(?:SPK)?\s*:\s*([^\n]+)',
+            r'##\s*1\.\s*LINGKUP\s+PEKERJAAN[\s\S]*?(?:memberi\s+perintah\s+kerja|melaksanakan|pekerjaan)\s+([\s\S]+?)\s+(?:dengan|sesuai|yang\s+diminta)',
+        ]
+        for jp in job_patterns:
+            m_job = re.search(jp, text, re.IGNORECASE)
+            if m_job:
+                raw_job = re.sub(r'[\r\n\t]+', ' ', m_job.group(1)).strip()
+                raw_job = re.sub(r'\s+(?:kepada|dengan|sesuai|sebesar|maka|antara)\s*:?$', '', raw_job, flags=re.IGNORECASE)
+                raw_job = re.sub(r'^[^\w]+|[^\w)]+$', '', raw_job).strip()
+                if len(raw_job) >= 10 and not raw_job.lower().startswith(('pihak', 'pasal', 'surat')):
+                    put(self._entity(text, 'Nama Pekerjaan', raw_job, m_job.start(), 0.85))
+                    break
 
         # "Dibuat di : Bandung" — nama kota berhuruf kapital, satu baris ("dibuat di hadapan Notaris" tidak ikut).
         closings = list(re.finditer(r'(?i:dibuat\s+di)[ \t]*:?[ \t]*(?:\n\s*:?[ \t]*)?([A-Z][A-Za-z]+(?:[ \t]+[A-Z][a-z]+)?)\b', text))
@@ -184,8 +229,8 @@ class ContextAnalyzer:
         parties: Dict[str, Dict[str, str]] = {'pihak_pertama': {}, 'pihak_kedua': {}}
         text = html.unescape(markdown_text).replace('**', '')
 
-        if re.search(r'PIHAK\s+PERTAMA', text, re.IGNORECASE) and re.search(r'PIHAK\s+KEDUA', text, re.IGNORECASE):
-            p1_split = re.split(r'selanjutnya\s+disebut\s*(?:sebagai\s*)?["\']?PIHAK\s+PERTAMA["\']?', text, maxsplit=1, flags=re.IGNORECASE)
+        if re.search(_FIRST_PARTY_LABEL, text, re.IGNORECASE) and re.search(_SECOND_PARTY_LABEL, text, re.IGNORECASE):
+            p1_split = re.split(rf'selanjutnya\s+disebut\s*(?:sebagai\s*)?["\']?{_FIRST_PARTY_LABEL}["\']?', text, maxsplit=1, flags=re.IGNORECASE)
             if len(p1_split) > 1:
                 p1_block = p1_split[0]
                 lowered = p1_block.lower()
@@ -193,7 +238,7 @@ class ContextAnalyzer:
                     p1_block = p1_block[lowered.rfind('bertanda tangan'):]
                 else:
                     p1_block = p1_block[-1200:]
-                p2_split = re.split(r'selanjutnya\s+disebut\s*(?:sebagai\s*)?["\']?PIHAK\s+KEDUA["\']?', p1_split[1], maxsplit=1, flags=re.IGNORECASE)
+                p2_split = re.split(rf'selanjutnya\s+disebut\s*(?:sebagai\s*)?["\']?{_SECOND_PARTY_LABEL}["\']?', p1_split[1], maxsplit=1, flags=re.IGNORECASE)
                 p2_block = p2_split[0] if len(p2_split) > 1 else ''
                 parties['pihak_pertama'] = ContextAnalyzer._parse_labeled_block(p1_block)
                 parties['pihak_kedua'] = ContextAnalyzer._parse_labeled_block(p2_block)

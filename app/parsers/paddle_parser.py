@@ -170,14 +170,13 @@ class PaddleOCRParser:
         return "paragraph"
 
     def _is_footer_noise(self, text_content: str) -> bool:
-        """Deteksi footer noise."""
-        noise_indicators = [
-            "www.", ".ac.id", ".co.id", ".com",
-            "Main Campus", "Jakarta Campus", "Surabaya Campus", "Purwokerto Campus"
-        ]
-        if len(text_content) > 200 and any(n in text_content for n in noise_indicators):
+        """Deteksi noise murni (nomor halaman tunggal atau URL murni tanpa teks lain)."""
+        t = text_content.strip()
+        if not t:
             return True
-        if re.match(r'^(https?://)?www\.\S+$', text_content.strip()):
+        if re.match(r'^\d+\s*/\s*\d+$', t):
+            return True
+        if re.match(r'^(https?://)?www\.[a-zA-Z0-9\.\-_]+\.[a-zA-Z]{2,4}/?$', t):
             return True
         return False
 
@@ -212,8 +211,32 @@ class PaddleOCRParser:
             img_w = pix.width
             img_h = pix.height
             
-            # Run PP-Structure layout detection
-            regions = layout_parser.parse_page_layout(img_bytes, img_w, img_h, page_num)
+            # Extract raw OCR boxes for complete 100% page coverage
+            high_res_bgr = render_pdf_page_high_res(page, target_dpi=config.DEFAULT_DPI)
+            enhanced_bgr = preprocess_image_for_ocr(high_res_bgr)
+            ocr_results = self.get_engine().ocr(enhanced_bgr, cls=True)
+            raw_boxes: List[OCRBox] = []
+            if ocr_results and ocr_results[0]:
+                for line in ocr_results[0]:
+                    box_coords = line[0]
+                    text_content = line[1][0].strip()
+                    confidence = round(float(line[1][1]), 3)
+                    if not text_content:
+                        continue
+                    xs = [pt[0] for pt in box_coords]
+                    ys = [pt[1] for pt in box_coords]
+                    raw_boxes.append(OCRBox(
+                        text=text_content,
+                        xmin=min(xs),
+                        ymin=min(ys),
+                        xmax=max(xs),
+                        ymax=max(ys),
+                        center_y=(min(ys) + max(ys)) / 2,
+                        confidence=confidence
+                    ))
+            
+            # Run PP-Structure layout detection with 100% OCR box recovery
+            regions = layout_parser.parse_page_layout(img_bytes, img_w, img_h, page_num, raw_ocr_boxes=raw_boxes)
             
             # Convert regions to markdown
             page_md = layout_parser.regions_to_markdown(regions)

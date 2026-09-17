@@ -8,7 +8,7 @@ Semua rule deterministik, tanpa LLM.
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from app.extractors.deterministic.dates import find_dates
+from app.extractors.deterministic.dates import find_dates, parse_id_date
 from app.extractors.deterministic.numbers import amounts_equal, parse_id_number, terbilang_to_number
 from app.schemas.evidence import Severity, ValidationIssue, ValidationReport
 
@@ -150,6 +150,24 @@ def _check_date_range(c: _Checker, key: str, data: Dict[str, Any]) -> None:
               expected=f">= {dates[0]}", actual=str(dates[1]))
 
 
+def _check_parties_distinct(c: _Checker, data: Dict[str, Any], p1_key: str = "Pihak Pertama", p2_key: str = "Pihak Kedua") -> None:
+    c.rule("parties_distinct")
+    p1, p2 = data.get(p1_key) or {}, data.get(p2_key) or {}
+    for key in ("Nama Perusahaan", "Alamat"):
+        v1, v2 = (p1.get(key) or "").strip().lower(), (p2.get(key) or "").strip().lower()
+        if v1 and v1 == v2:
+            c.add("parties_distinct", Severity.ERROR, [f"{p1_key}.{key}", f"{p2_key}.{key}"],
+                  f"{key} {p1_key} dan {p2_key} identik (kemungkinan tertukar/tersalin)")
+
+
+def _check_field_date_order(c: _Checker, rule: str, earlier_key: str, later_key: str, data: Dict[str, Any]) -> None:
+    c.rule(rule)
+    earlier, later = parse_id_date(str(data.get(earlier_key) or "")), parse_id_date(str(data.get(later_key) or ""))
+    if earlier and later and later < earlier:
+        c.add(rule, Severity.ERROR, [earlier_key, later_key],
+              f"{later_key} ({later}) lebih awal dari {earlier_key} ({earlier})", expected=f">= {earlier}", actual=str(later))
+
+
 def validate_contract(data: Dict[str, Any]) -> ValidationReport:
     c = _Checker()
     _check_required(c, ["Nomor Kontrak Kerja", "Nama Pekerjaan", "Pihak Pertama.Nama Perusahaan", "Pihak Kedua.Nama Perusahaan"], data)
@@ -157,14 +175,7 @@ def validate_contract(data: Dict[str, Any]) -> ValidationReport:
     _check_items(c, "List Item/Barang", "volume", "Harga Satuan", "Jumlah Harga", "sub total", "Total Harga Pekerjaan", data)
     _check_terbilang(c, "Jumlah Terbilang", ["Total Harga Pekerjaan", "sub total"], data)
     _check_date_range(c, "Jangka Waktu", data)
-
-    c.rule("parties_distinct")
-    p1, p2 = data.get("Pihak Pertama") or {}, data.get("Pihak Kedua") or {}
-    for key in ("Nama Perusahaan", "Alamat"):
-        v1, v2 = (p1.get(key) or "").strip().lower(), (p2.get(key) or "").strip().lower()
-        if v1 and v1 == v2:
-            c.add("parties_distinct", Severity.ERROR, [f"Pihak Pertama.{key}", f"Pihak Kedua.{key}"],
-                  f"{key} Pihak Pertama dan Pihak Kedua identik (kemungkinan tertukar/tersalin)")
+    _check_parties_distinct(c, data)
     return c.report()
 
 
@@ -176,9 +187,28 @@ def validate_sph(data: Dict[str, Any]) -> ValidationReport:
     return c.report()
 
 
+def validate_bast(data: Dict[str, Any]) -> ValidationReport:
+    c = _Checker()
+    _check_required(c, ["Pihak Pertama.Nama Perusahaan", "Pihak Kedua.Nama Perusahaan"], data)
+    _check_parties_distinct(c, data)
+    _check_field_date_order(c, "serah_terima_after_po_kontrak", "Tanggal PO / Kontrak", "Tanggal Serah Terima", data)
+
+    c.rule("references_source_document")
+    if not data.get("Nomor PO / Kontrak") and not data.get("Nama Pekerjaan"):
+        c.add("references_source_document", Severity.WARNING, ["Nomor PO / Kontrak", "Nama Pekerjaan"],
+              "BAST tidak merujuk ke nomor PO/Kontrak maupun nama pekerjaan apa pun -- sulit ditautkan ke dokumen sumbernya")
+
+    c.rule("has_items")
+    if not data.get("Daftar Barang/Pekerjaan Diserahkan"):
+        c.add("has_items", Severity.WARNING, ["Daftar Barang/Pekerjaan Diserahkan"],
+              "Tidak ada barang/pekerjaan yang tercatat diserahterimakan")
+    return c.report()
+
+
 _VALIDATORS: Dict[str, Callable[[Dict[str, Any]], ValidationReport]] = {
     "contract": validate_contract,
     "sph": validate_sph,
+    "bast": validate_bast,
 }
 
 

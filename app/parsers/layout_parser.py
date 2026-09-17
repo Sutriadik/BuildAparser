@@ -1,14 +1,13 @@
 """
-Open ADE — Layout-Aware Parser using PP-Structure
+Open ADE — Layout-Aware Parser using PP-Structure (v2: Robust Multi-type Layout)
 
 Menggunakan PaddlePaddle PP-Structure untuk mendeteksi region layout pada halaman dokumen:
-- text: Paragraf teks biasa
-- title: Judul/heading
+- text / paragraph: Paragraf teks biasa
+- title / section_header: Judul/heading → ## Heading
+- list / list_item: Daftar bernomor / bullet points → 1. Item / - Item
 - table: Tabel → diproses oleh SLANet → output HTML → konversi ke Markdown table
-- figure: Gambar/logo/grafik → annotated sebagai [IMAGE]
-- header/footer: Header/footer halaman → di-skip
-
-Menggantikan flat OCR approach dengan region-aware assembly.
+- figure / image: Jika ada baris teks/tabel OCR di dalamnya, diekstrak secara terstruktur.
+- header / footer: Mempertahankan informasi nomor surat, tanggal, dan penandatangan.
 """
 import re
 import time
@@ -27,9 +26,9 @@ from app.parsers.table_converter import html_table_to_markdown
 @dataclass
 class LayoutRegion:
     """Satu region layout yang terdeteksi oleh PP-Structure."""
-    region_type: str       # text, title, table, figure, header, footer
+    region_type: str       # text, title, table, figure, header, footer, list
     bbox: List[float]      # [x1, y1, x2, y2] in pixels
-    text: str = ""         # Teks hasil OCR (untuk text/title regions)
+    text: str = ""         # Teks hasil OCR (untuk text/title/list regions)
     html: str = ""         # HTML table (untuk table regions)
     confidence: float = 0.0
     page: int = 1
@@ -60,16 +59,16 @@ class LayoutParser:
     
     @classmethod
     def get_engine(cls):
-        """Lazy-load PPStructure engine (singleton)."""
+        """Lazy-load PPStructure engine (singleton). Layout model PPStructure wajib en/ch."""
         if cls._engine is None:
             from paddleocr import PPStructure
             cls._engine = PPStructure(
                 show_log=False,
                 recovery=True,
-                lang=config.OCR_LANG,
+                lang="en",  # Model layout PP-Structure hanya mendukung 'en' atau 'ch'
                 use_gpu=False,
             )
-            logger.info("🏗️  PP-Structure engine initialized")
+            logger.info("🏗️  PP-Structure layout engine initialized (lang=en)")
         return cls._engine
     
     def _normalize_bbox(
@@ -84,68 +83,114 @@ class LayoutParser:
             round(max(0.0, min(1.0, y2 / img_h)), 5),
         )
     
-    def _extract_text_from_res(self, res_list: List[Dict]) -> str:
+    def _extract_boxes_and_text_from_res(
+        self, res_list: Any
+    ) -> str:
         """
-        Ekstrak teks dari result list PP-Structure region.
-        Setiap item di res_list biasanya dict dengan 'text' dan 'confidence'.
+        Ekstrak teks terstruktur dari result list PP-Structure region.
+        Menggunakan spatial line clustering jika ada beberapa baris OCR.
         """
         if not res_list:
             return ""
         
-        texts = []
-        for item in res_list:
-            if isinstance(item, dict):
-                text = item.get("text", "")
-                if text:
-                    texts.append(text.strip())
-            elif isinstance(item, (list, tuple)):
-                # Nested format: [[bbox, (text, conf)], ...]
-                for sub in item:
-                    if isinstance(sub, (list, tuple)) and len(sub) >= 2:
-                        if isinstance(sub[1], (list, tuple)):
-                            texts.append(str(sub[1][0]).strip())
-                        elif isinstance(sub[1], str):
-                            texts.append(sub[1].strip())
+        if isinstance(res_list, str):
+            return res_list.strip()
+            
+        from app.parsers.paddle_parser import OCRBox, cluster_and_merge_lines
         
-        return " ".join(texts)
+        raw_boxes: List[OCRBox] = []
+        if isinstance(res_list, list):
+            for item in res_list:
+                if isinstance(item, dict):
+                    text = item.get("text", "").strip()
+                    conf = float(item.get("confidence", 0.9))
+                    tr = item.get("text_region")
+                    if text and tr:
+                        xs = [p[0] for p in tr]
+                        ys = [p[1] for p in tr]
+                        raw_boxes.append(OCRBox(
+                            text=text,
+                            xmin=min(xs),
+                            ymin=min(ys),
+                            xmax=max(xs),
+                            ymax=max(ys),
+                            center_y=(min(ys) + max(ys)) / 2,
+                            confidence=conf,
+                        ))
+                    elif text:
+                        raw_boxes.append(OCRBox(
+                            text=text, xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0, center_y=0.0, confidence=conf
+                        ))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    tr = item[0]
+                    content = item[1]
+                    text = ""
+                    conf = 0.9
+                    if isinstance(content, (list, tuple)):
+                        text = str(content[0]).strip()
+                        conf = float(content[1]) if len(content) > 1 else 0.9
+                    elif isinstance(content, str):
+                        text = content.strip()
+                    if text and isinstance(tr, (list, tuple)) and len(tr) >= 4:
+                        xs = [p[0] for p in tr]
+                        ys = [p[1] for p in tr]
+                        raw_boxes.append(OCRBox(
+                            text=text,
+                            xmin=min(xs),
+                            ymin=min(ys),
+                            xmax=max(xs),
+                            ymax=max(ys),
+                            center_y=(min(ys) + max(ys)) / 2,
+                            confidence=conf,
+                        ))
+                    elif text:
+                        raw_boxes.append(OCRBox(
+                            text=text, xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0, center_y=0.0, confidence=conf
+                        ))
+        
+        if not raw_boxes:
+            return ""
+            
+        from app.parsers.table_converter import format_structured_tabular_boxes
+        structured_table = format_structured_tabular_boxes(raw_boxes, y_tol=14)
+        if "|" in structured_table:
+            return structured_table
+            
+        merged = cluster_and_merge_lines(raw_boxes, y_tolerance=12, x_gap_tolerance=80)
+        lines_text = [b.text for b in merged if b.text.strip()]
+        return "\n".join(lines_text)
 
-    def _is_footer_region(self, region: LayoutRegion, img_h: int) -> bool:
-        """Deteksi apakah region ini adalah footer (bagian bawah halaman)."""
-        # Region di bawah 90% halaman
-        if region.bbox[1] / img_h > 0.88:
+    def _is_noise_region(self, region: LayoutRegion, img_h: int) -> bool:
+        """Deteksi apakah region ini adalah noise murni (nomor halaman tunggal '1/1' atau whitespace kosong)."""
+        t = region.text.strip()
+        if not t and not region.html:
             return True
-        # Teks mengandung URL, alamat kampus, dll
-        if region.text and any(kw in region.text.lower() for kw in [
-            "www.", ".ac.id", ".co.id", "campus", "kampus"
-        ]):
-            return True
-        return False
-
-    def _is_header_region(self, region: LayoutRegion, img_h: int) -> bool:
-        """Deteksi apakah region ini adalah header (logo/branding di atas)."""
-        # Region di atas 5% halaman dan kecil (logo)
-        if region.bbox[3] / img_h < 0.06:
+        # Nomor halaman tunggal di pojok bawah misal "1 / 2"
+        if re.match(r'^\d+\s*/\s*\d+$', t) and region.bbox[1] / img_h > 0.92:
             return True
         return False
 
     def parse_page_layout(
-        self, img_bytes: bytes, img_w: int, img_h: int, page_num: int
+        self, img_bytes: bytes, img_w: int, img_h: int, page_num: int,
+        raw_ocr_boxes: Optional[List[Any]] = None
     ) -> List[LayoutRegion]:
         """
-        Mendeteksi layout region pada satu halaman menggunakan PP-Structure.
+        Mendeteksi layout region pada satu halaman menggunakan PP-Structure,
+        dan menggabungkan seluruh OCR boxes yang tidak tercover oleh layout detection
+        sehingga tidak ada kop surat, nomor, perihal, lampiran, atau footer yang terlewat.
         
         Args:
             img_bytes: PNG bytes dari halaman PDF
             img_w: Lebar gambar (pixels)
             img_h: Tinggi gambar (pixels)
             page_num: Nomor halaman (1-indexed)
+            raw_ocr_boxes: List of OCRBox dari PaddleOCR untuk 100% coverage
             
         Returns:
             List[LayoutRegion] yang sudah di-sort berdasarkan reading order
         """
         engine = self.get_engine()
         
-        # Convert bytes to numpy array for PPStructure
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_array = np.array(img)
         
@@ -173,65 +218,104 @@ class LayoutParser:
             )
             
             if region_type == "table":
-                # Table region: extract HTML from 'res' → 'html'
                 res = block.get("res", {})
                 if isinstance(res, dict):
                     region.html = res.get("html", "")
                 elif isinstance(res, str):
                     region.html = res
-                # Juga simpan teks mentah untuk grounding
-                region.text = "[TABLE]"
                 
-            elif region_type == "figure":
-                region.text = "[IMAGE]"
+                # Jika ada teks dari res, ekstrak juga
+                if isinstance(res, list):
+                    region.text = self._extract_boxes_and_text_from_res(res)
+                elif not region.text:
+                    region.text = "[TABLE]"
+                
+            elif region_type in ("figure", "image"):
+                # Jangan buang teks OCR yang ada di dalam figure/tabel
+                res = block.get("res", [])
+                extracted_text = self._extract_boxes_and_text_from_res(res)
+                if extracted_text and len(extracted_text) > 10:
+                    region.text = extracted_text
+                else:
+                    region.text = "[IMAGE]"
                 
             else:
-                # Text/title region: extract OCR text
+                # text, title, list, header, footer, reference
                 res = block.get("res", [])
-                if isinstance(res, list):
-                    text_parts = []
-                    for line in res:
-                        if isinstance(line, dict):
-                            text_parts.append(line.get("text", ""))
-                        elif isinstance(line, (list, tuple)) and len(line) >= 2:
-                            if isinstance(line[1], (list, tuple)):
-                                text_parts.append(str(line[1][0]))
-                            elif isinstance(line[1], str):
-                                text_parts.append(line[1])
-                    region.text = " ".join(t.strip() for t in text_parts if t.strip())
-                elif isinstance(res, str):
-                    region.text = res
+                region.text = self._extract_boxes_and_text_from_res(res)
             
-            # Filter: skip low confidence regions
-            if region.confidence < config.LAYOUT_SCORE_THRESHOLD:
-                logger.debug(f"  Skip low-confidence region: {region_type} ({region.confidence:.2f})")
-                continue
-            
-            # Filter: skip footer/header noise
-            if self._is_footer_region(region, img_h):
-                logger.debug(f"  Skip footer region: {region.text[:50]}...")
-                continue
-            if self._is_header_region(region, img_h) and region_type != "title":
-                logger.debug(f"  Skip header region: {region.text[:50]}...")
+            # Filter noise murni
+            if self._is_noise_region(region, img_h):
                 continue
             
             regions.append(region)
         
-        # Sort by reading order: top-to-bottom, then left-to-right
-        regions.sort(key=lambda r: (r.bbox[1], r.bbox[0]))
+        # Recover missed OCR boxes (letterheads, headers, footers, signatures)
+        if raw_ocr_boxes:
+            from app.parsers.paddle_parser import cluster_and_merge_lines
+            
+            def is_inside_regions(box: Any, current_regions: List[LayoutRegion], tol: float = 12.0) -> bool:
+                b_xmin = box.xmin * img_w if box.xmin <= 1.0 else box.xmin
+                b_xmax = box.xmax * img_w if box.xmax <= 1.0 else box.xmax
+                b_ymin = box.ymin * img_h if box.ymin <= 1.0 else box.ymin
+                b_ymax = box.ymax * img_h if box.ymax <= 1.0 else box.ymax
+                box_h = max(b_ymax - b_ymin, 1.0)
+                
+                for r in current_regions:
+                    rx1, ry1, rx2, ry2 = r.bbox
+                    # Vertical overlap check
+                    overlap_y = max(0.0, min(b_ymax, ry2) - max(b_ymin, ry1))
+                    if overlap_y / box_h > 0.5:
+                        return True
+                return False
+
+            missed = [b for b in raw_ocr_boxes if not is_inside_regions(b, regions)]
+            if missed:
+                # Group missed boxes into lines
+                merged_missed = cluster_and_merge_lines(missed, y_tolerance=14, x_gap_tolerance=80)
+                for mb in merged_missed:
+                    mb_ymin = mb.ymin * img_h if mb.ymin <= 1.0 else mb.ymin
+                    mb_ymax = mb.ymax * img_h if mb.ymax <= 1.0 else mb.ymax
+                    mb_xmin = mb.xmin * img_w if mb.xmin <= 1.0 else mb.xmin
+                    mb_xmax = mb.xmax * img_w if mb.xmax <= 1.0 else mb.xmax
+                    mb_center_y = (mb_ymin + mb_ymax) / 2.0
+                    
+                    if mb_center_y < img_h * 0.35:
+                        r_type = "header"
+                    elif mb_center_y > img_h * 0.70:
+                        r_type = "footer"
+                    else:
+                        r_type = "text"
+                        
+                    norm = self._normalize_bbox([mb_xmin, mb_ymin, mb_xmax, mb_ymax], img_w, img_h)
+                    regions.append(LayoutRegion(
+                        region_type=r_type,
+                        bbox=[mb_xmin, mb_ymin, mb_xmax, mb_ymax],
+                        text=mb.text,
+                        confidence=mb.confidence,
+                        page=page_num,
+                        norm_xmin=norm[0],
+                        norm_ymin=norm[1],
+                        norm_xmax=norm[2],
+                        norm_ymax=norm[3],
+                    ))
         
+        # Sort by reading order: top-to-bottom (Y), then left-to-right (X)
+        # Dengan toleransi Y 20px agar item sebaris (misal Label : Nilai) diurutkan kiri->kanan
+        regions.sort(key=lambda r: (round(r.bbox[1] / 20.0) * 20.0, r.bbox[0]))
+        
+        table_count = sum(1 for r in regions if r.region_type == "table")
+        figure_count = sum(1 for r in regions if r.region_type in ("figure", "image"))
         logger.debug(
             f"  Page {page_num}: {len(regions)} layout regions detected "
-            f"({sum(1 for r in regions if r.region_type == 'table')} tables, "
-            f"{sum(1 for r in regions if r.region_type == 'figure')} figures)"
+            f"({table_count} tables, {figure_count} figures)"
         )
         
         return regions
     
     def regions_to_markdown(self, regions: List[LayoutRegion]) -> str:
         """
-        Menyusun markdown dari list of layout regions.
-        Setiap tipe region diformat berbeda.
+        Menyusun markdown terstruktur dari list of layout regions.
         
         Args:
             regions: List[LayoutRegion] yang sudah sorted
@@ -243,45 +327,57 @@ class LayoutParser:
         
         for region in regions:
             text = region.text.strip() if region.text else ""
+            if not text and not region.html:
+                continue
+                
+            r_type = region.region_type.lower()
             
-            if region.region_type == "title":
+            if r_type in ("title", "section_header"):
                 if text:
-                    # Clean OCR typos pada title
                     text = clean_ocr_line(text)
                     md_parts.append(f"\n## {text}\n")
                     
-            elif region.region_type == "table":
+            elif r_type == "table":
                 if region.html:
                     md_table = html_table_to_markdown(region.html)
                     if md_table:
                         md_parts.append(f"\n{md_table}\n")
-                    else:
-                        # Fallback: raw text jika table conversion gagal
-                        if text and text != "[TABLE]":
-                            md_parts.append(text)
-                            
-            elif region.region_type == "figure":
-                md_parts.append(f"\n[IMAGE: detected at page {region.page}]\n")
-                
-            elif region.region_type in ("text", "reference"):
-                if text:
-                    text = clean_ocr_line(text)
+                    elif text and text != "[TABLE]":
+                        md_parts.append(text)
+                elif text and text != "[TABLE]":
+                    md_parts.append(text)
                     
-                    # Detect key-value pairs
-                    if ":" in text and len(text) < 120:
-                        md_parts.append(text)
-                    else:
-                        md_parts.append(text)
-                        
-            elif region.region_type == "figure_caption":
+            elif r_type in ("figure", "image"):
+                if text and text != "[IMAGE]":
+                    md_parts.append(text)
+                else:
+                    md_parts.append(f"\n<!-- image: page {region.page} -->\n")
+                    
+            elif r_type in ("list", "list_item"):
                 if text:
-                    md_parts.append(f"*{text}*")
-            
-            # Skip header/footer types (already filtered)
+                    lines = text.split("\n")
+                    formatted = []
+                    for l in lines:
+                        cleaned = clean_ocr_line(l)
+                        if not cleaned:
+                            continue
+                        if re.match(r'^\d+[\.\)]\s*', cleaned) or cleaned.startswith("- ") or cleaned.startswith("* "):
+                            formatted.append(cleaned)
+                        else:
+                            formatted.append(f"- {cleaned}")
+                    if formatted:
+                        md_parts.append("\n".join(formatted))
+                        
+            elif r_type in ("text", "paragraph", "reference", "header", "footer"):
+                if text:
+                    lines = [clean_ocr_line(l) for l in text.split("\n") if l.strip()]
+                    if lines:
+                        md_parts.append("\n".join(lines))
+                        
+            elif r_type == "figure_caption":
+                if text:
+                    md_parts.append(f"*{clean_ocr_line(text)}*")
         
         raw_md = "\n\n".join(md_parts)
-        
-        # Apply full text cleaning
         cleaned_md = clean_ocr_text(raw_md)
-        
         return cleaned_md

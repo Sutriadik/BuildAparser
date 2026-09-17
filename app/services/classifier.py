@@ -17,9 +17,20 @@ TITLE_WINDOW_CHARS = 600
 
 _RULES: Dict[str, List[Tuple[str, float]]] = {
     "contract": [
-        (r"\bSURAT\s+PERINTAH\s+KERJA\b", 3.0), (r"\bSPK\b", 2.0), (r"\bPERJANJIAN\b", 2.0),
-        (r"\bKONTRAK\b", 2.0), (r"\bPIHAK\s+PERTAMA\b", 1.5), (r"\bPIHAK\s+KEDUA\b", 1.5),
-        (r"\bKONTRAK\s+LAYANAN\b", 2.0),
+        # Mencakup varian dokumen kontrak pengadaan Indonesia: SPK, Kontrak/PKS, dan
+        # Nota/Surat Pesanan (dokumen pemesanan ringkas dari pelanggan ke vendor).
+        #
+        # "KONTRAK" tanpa kualifikasi TIDAK dijadikan sinyal kuat: BAST/dokumen lain sering
+        # menyebutnya hanya sebagai rujukan ("Nomor PO / Kontrak", "sesuai dokumen PO/Kontrak")
+        # tanpa dokumen itu sendiri berupa kontrak. Begitu juga "PIHAK PERTAMA/KEDUA" -- BAST
+        # memakai istilah yang sama persis untuk pihak penyerah/penerima, jadi tidak
+        # membedakan kontrak vs BAST dan sengaja TIDAK dipakai sebagai sinyal di sini.
+        # SPMK (Surat Perintah Mulai Kerja) = perintah resmi mulai bekerja setelah kontrak
+        # ditandatangani -- dokumen keluarga SPK, dialurkan ke schema kontrak yang sama.
+        (r"\bSURAT\s+PERINTAH\s+(?:MULAI\s+)?KERJA\b", 3.0), (r"\bSPM?K\b", 2.0),
+        (r"\bPERJANJIAN\s+KERJA\s*SAMA\b", 3.0), (r"\bPERJANJIAN\b", 2.0), (r"\bPKS\b", 2.0),
+        (r"\bKONTRAK\s+LAYANAN\b", 2.5), (r"\bKONTRAK\s+PENGADAAN\b", 2.5), (r"\bKONTRAK\b", 0.75),
+        (r"\bNOTA\s+PESANAN\b", 3.0), (r"\bSURAT\s+PESANAN\b", 3.0), (r"\bPURCHASE\s+ORDER\b", 1.5),
     ],
     "sph": [
         (r"\bSURAT\s+PENAWARAN\s+HARGA\b", 3.0), (r"\bSPH\b", 2.0), (r"\bPENAWARAN\s+HARGA\b", 2.5),
@@ -27,7 +38,8 @@ _RULES: Dict[str, List[Tuple[str, float]]] = {
     ],
     "bast": [
         (r"\bBERITA\s+ACARA\s+SERAH\s+TERIMA\b", 3.5), (r"\bBAST\b", 2.5), (r"\bSERAH\s+TERIMA\s+PEKERJAAN\b", 2.5),
-        (r"\bBERITA\s+ACARA\s+PENYELESAIAN\b", 2.5),
+        (r"\bBERITA\s+ACARA\s+PENYELESAIAN\b", 2.5), (r"\bBERITA\s+ACARA\s+PENERIMAAN\s+PEKERJAAN\b", 3.0),
+        (r"\bBERITA\s+ACARA\s+UJI\s+TERIMA\b", 2.0),
     ],
 }
 MIN_SCORE = 2.0
@@ -88,7 +100,7 @@ class DocumentClassifier:
         system_prompt = (
             "Anda adalah AI Classifier dokumen pengadaan, hukum, dan administrasi.\n"
             "Tentukan jenis dokumen berikut:\n"
-            "- 'contract': Surat Perintah Kerja (SPK), Perjanjian, atau Kontrak.\n"
+            "- 'contract': Surat Perintah Kerja (SPK), Perjanjian/Kontrak Kerja Sama (PKS), atau Nota/Surat Pesanan.\n"
             "- 'sph': Surat Penawaran Harga dari vendor/penyedia.\n"
             "- 'bast': Berita Acara Serah Terima pekerjaan/barang.\n"
             "- 'general': dokumen lain."

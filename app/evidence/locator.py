@@ -39,6 +39,14 @@ class EvidenceMatch:
     source_confidence: float = 0.95
 
 
+def _to_bounding_box(b: Optional[BBox]) -> Optional[BoundingBox]:
+    if b is None:
+        return None
+    x1, x2 = (round(max(0.0, min(1.0, float(v))), 5) for v in (b[0], b[2]))
+    y1, y2 = (round(max(0.0, min(1.0, float(v))), 5) for v in (b[1], b[3]))
+    return BoundingBox(xmin=min(x1, x2), ymin=min(y1, y2), xmax=max(x1, x2), ymax=max(y1, y2))
+
+
 def _union_bbox(blocks: List[DocumentBlock]) -> Optional[BBox]:
     boxes = [b.bbox for b in blocks if b.bbox]
     if not boxes:
@@ -156,8 +164,7 @@ def build_field_evidence(
             value=value,
             source_document=ir.file_name,
             page=match.page if match else None,
-            bbox=BoundingBox(xmin=match.bbox[0], ymin=match.bbox[1], xmax=match.bbox[2], ymax=match.bbox[3])
-            if match and match.bbox else None,
+            bbox=_to_bounding_box(match.bbox) if match and match.bbox else None,
             evidence_text=match.text[:300] if match else None,
             block_ids=match.block_ids if match else [],
             match_type=match.match_type if match else None,

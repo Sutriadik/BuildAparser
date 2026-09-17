@@ -7,6 +7,13 @@ def _env_int(name: str, default: int) -> int:
     return int(os.getenv(name, default))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 class AppConfig(BaseModel):
     # Base paths
     BASE_DIR: Path = Path(__file__).resolve().parent.parent
@@ -22,13 +29,15 @@ class AppConfig(BaseModel):
     OLLAMA_TEMPERATURE: float = 0.0
     OLLAMA_SEED: int = _env_int("OLLAMA_SEED", 42)
     # Wajib eksplisit: default server Ollama (umumnya 4096) memotong prompt kontrak (~8k token) diam-diam.
-    OLLAMA_NUM_CTX: int = _env_int("OLLAMA_NUM_CTX", 12288)
+    OLLAMA_NUM_CTX: int = _env_int("OLLAMA_NUM_CTX", 16384)
     OLLAMA_KEEP_ALIVE: str = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
     OLLAMA_TIMEOUT: float = float(os.getenv("OLLAMA_TIMEOUT", "600"))
     # Batas token output: mencegah model "berputar" menghasilkan JSON tanpa akhir sampai timeout.
     OLLAMA_NUM_PREDICT: int = _env_int("OLLAMA_NUM_PREDICT", 4096)
+    ENABLE_LLM_MARKDOWN_REFINER: bool = _env_bool("ENABLE_LLM_MARKDOWN_REFINER", True)
 
     # Parser settings
+    DEFAULT_PARSER: str = os.getenv("DEFAULT_PARSER", "paddle")
     DEFAULT_DPI: int = 150
     OCR_LANG: str = os.getenv("OCR_LANG", "en")
     SCANNED_CHAR_THRESHOLD: int = 40          # rata-rata karakter/halaman di bawah ini = scan
@@ -41,7 +50,9 @@ class AppConfig(BaseModel):
     # Extraction settings
     MAX_EXTRACTION_RETRIES: int = _env_int("MAX_EXTRACTION_RETRIES", 1)
     NULL_FIELD_THRESHOLD: float = 0.30  # Retry jika > 30% fields null
-    EFFECTIVE_TEXT_MAX_CHARS: int = _env_int("EFFECTIVE_TEXT_MAX_CHARS", 12000)
+    # Konteks efektif dinaikkan ke 32.000 karakter agar seluruh isi dokumen (hingga ~15-20 halaman)
+    # terbaca utuh oleh Qwen 2.5 (12K context window) untuk menjaga rich context & visual grounding.
+    EFFECTIVE_TEXT_MAX_CHARS: int = _env_int("EFFECTIVE_TEXT_MAX_CHARS", 32000)
 
     # Grounding Linker settings
     GROUNDING_MIN_SCORE: float = 0.65  # Minimum calibrated score untuk visual grounding bounding box

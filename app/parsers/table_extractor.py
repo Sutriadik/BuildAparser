@@ -231,6 +231,11 @@ def extract_items_from_markdown_tables(markdown_text: str, doc_type: str = "sph"
     tables = extract_tables_from_markdown(markdown_text)
     extracted_items = []
     
+    # BAST (Berita Acara Serah Terima) mendaftar barang/pekerjaan yang diserahkan TANPA kolom
+    # harga -- tabel itu valid untuk BAST, tapi untuk kontrak/SPH tabel tanpa harga biasanya
+    # daftar pejabat/jadwal/SLA, bukan BoQ.
+    require_price = doc_type.lower() != "bast"
+    
     current_kategori = None
     kategori_item_counter = 0
     table_item_counter = 0
@@ -242,8 +247,7 @@ def extract_items_from_markdown_tables(markdown_text: str, doc_type: str = "sph"
         desc_col, qty_col, unit_col, period_col = cols["desc"], cols["qty"], cols["unit"], cols["period"]
         price_cols, total_cols = cols["price"], cols["total"]
 
-        # Tabel tanpa kolom harga (daftar pejabat, jadwal, SLA) bukan tabel BoQ.
-        if not price_cols and not total_cols:
+        if require_price and not price_cols and not total_cols:
             continue
 
         for r in table["rows"]:
@@ -319,8 +323,8 @@ def extract_items_from_markdown_tables(markdown_text: str, doc_type: str = "sph"
             extra = {k: v.strip() for k, v in r.items() if k not in exclude_keys and not k.startswith("_") and v and v.strip()}
             
             # Baris tanpa harga di tabel BoQ = judul kelompok atau header yang terulang (hasil OCR),
-            # bukan item yang ditagih.
-            if h_sat == 0.0 and h_tot == 0.0:
+            # bukan item yang ditagih. Untuk BAST, tidak adanya harga itu normal -- jangan di-skip.
+            if require_price and h_sat == 0.0 and h_tot == 0.0:
                 if not _header_matches(clean_desc, DESC_KEYWORDS + ["uralan"]):
                     current_kategori = clean_desc
                 continue
@@ -346,6 +350,16 @@ def extract_items_from_markdown_tables(markdown_text: str, doc_type: str = "sph"
                     "Periode/Durasi": periode,
                     "Harga Satuan": h_sat,
                     "Jumlah Harga": h_tot,
+                    "Keterangan": None,
+                    "Atribut Tambahan": extra if extra else None
+                }
+            elif doc_type.lower() == "bast":
+                item_dict = {
+                    "No": item_seq_no,
+                    "Deskripsi": clean_desc,
+                    "Volume": vol,
+                    "Satuan": unit,
+                    "Hasil Uji Terima": None,
                     "Keterangan": None,
                     "Atribut Tambahan": extra if extra else None
                 }

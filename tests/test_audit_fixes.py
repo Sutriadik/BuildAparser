@@ -301,3 +301,229 @@ def test_llm_output_is_capped():
     from app.extractors.ollama_client import OllamaExtractor
 
     assert OllamaExtractor()._options()["num_predict"] > 0
+
+
+# ---------------------------------------------------------------- generalization: doc types beyond samples
+def test_classifier_detects_pks_and_nota_pesanan():
+    pks_doc = "PERJANJIAN KERJA SAMA\nNomor: 12/PKS/2031\nantara PT A dan PT B tentang layanan jaringan"
+    nota_doc = "NOTA PESANAN\nNomor: 045/NP/2031\nKepada: PT Vendor Contoh\nBerikut kami pesan barang sebagai berikut:"
+    c = DocumentClassifier()
+    assert c.classify_fast_rule(pks_doc)[0] == "contract"
+    assert c.classify_fast_rule(nota_doc)[0] == "contract"
+
+
+def test_party_extraction_handles_pihak_kesatu_synonym():
+    md = ("PERJANJIAN KERJA SAMA\nPada hari ini ... kami yang bertanda tangan dibawah ini:\n"
+          "Nama : Andi Wijaya\nJabatan : Kepala Bagian Pengadaan\nAlamat : Jl. Diponegoro No. 5, Malang\n"
+          "Yang dalam hal ini mewakili secara sah : PT CONTOH SATU, selanjutnya disebut sebagai PIHAK KESATU, dan\n"
+          "Nama : Budi Santoso\nJabatan : Direktur\nAlamat : Jl. Sudirman No. 9, Malang\n"
+          "Yang dalam hal ini mewakili secara sah : CV CONTOH DUA, selanjutnya disebut sebagai PIHAK KEDUA")
+    parties = ContextAnalyzer.extract_parties_from_preamble(md)
+    assert parties["pihak_pertama"]["nama_perusahaan"] == "PT CONTOH SATU"
+    assert parties["pihak_kedua"]["nama_perusahaan"] == "CV CONTOH DUA"
+
+
+def test_contract_schema_allows_minimal_nota_pesanan_without_hallucination_fields():
+    """
+    Nota Pesanan seringkali hanya berisi: pemesan, penerima pesanan, daftar barang, total.
+    Tanpa blok tanda tangan formal (jabatan/alamat pejabat) atau nomor kontrak resmi.
+    Schema tidak boleh memaksa field itu diisi string -- harus bisa null.
+    """
+    from app.schemas.contract import ContractExtractionSchema
+
+    minimal = {
+        "Pihak Pertama": {"Nama Perusahaan": "PT Pemesan Contoh"},          # tanpa representative/jabatan/alamat
+        "Pihak Kedua": {"Nama Perusahaan": "CV Vendor Contoh"},
+        "List Item/Barang": [{
+            "Deskripsi Item/Barang/Pekerjaan": "Kabel UTP Cat6", "volume": 100, "unit": "meter",
+            "Harga Satuan": 15000, "Jumlah Harga": 1500000,
+        }],
+        # nomor_kontrak, nama_pekerjaan, sub_total, total_harga_pekerjaan sengaja tidak diisi
+    }
+    extracted = ContractExtractionSchema.model_validate(minimal)
+    assert extracted.nomor_kontrak is None
+    assert extracted.pihak_pertama.jabatan is None
+    assert extracted.pihak_pertama.alamat is None
+    assert extracted.sub_total is None
+    assert extracted.total_harga_pekerjaan is None
+
+
+def test_ppn_autocalc_does_not_crash_when_totals_missing():
+    """Regression: extracted.total_harga_pekerjaan > extracted.sub_total > 0 dulu TypeError jika None."""
+    from app.extractors.ollama_client import OllamaExtractor
+    from app.schemas.contract import ContractExtractionSchema
+
+    minimal = {
+        "Pihak Pertama": {"Nama Perusahaan": "PT A"}, "Pihak Kedua": {"Nama Perusahaan": "PT B"},
+        "List Item/Barang": [],
+    }
+    extracted = ContractExtractionSchema.model_validate(minimal)
+    assert extracted.total_harga_pekerjaan is None and extracted.sub_total is None
+    # Simulasikan blok auto-calc PPN di extract_contract() tanpa memanggil LLM sungguhan.
+    if ((extracted.total_ppn is None or extracted.total_ppn == 0.0)
+            and extracted.total_harga_pekerjaan and extracted.sub_total
+            and extracted.total_harga_pekerjaan > extracted.sub_total > 0):
+        extracted.total_ppn = 999  # tidak boleh sampai sini
+    assert extracted.total_ppn == 0.0
+
+
+def test_docling_converter_allows_non_pdf_formats_by_default():
+    """
+    format_options hanya menimpa opsi untuk PDF; format lain (DOCX, gambar) tetap
+    memakai default Docling, bukan dibatasi hanya-PDF.
+    """
+    from docling.datamodel.base_models import InputFormat
+    from app.parsers.docling_parser import DoclingParser
+
+    converter = DoclingParser()._get_converter(do_ocr=False)
+    assert InputFormat.DOCX in converter.allowed_formats
+    assert InputFormat.IMAGE in converter.allowed_formats
+
+
+# ---------------------------------------------------------------- BAST (Berita Acara Serah Terima)
+# Ditambahkan setelah eksplorasi "Data Project BUT": 18 proyek nyata, masing-masing punya
+# Kontrak/SPK/PKS/Nota-Pesanan + SPH + BAST. BAST ternyata dokumen terpisah dengan struktur
+# sendiri (bukan varian kontrak): tabel TANPA kolom harga, kadang memuat bagian tambahan
+# "Berita Acara Uji Terima". Teks contoh di bawah diparafrasakan dari pola yang berulang di
+# seluruh 18 proyek tsb, bukan salinan persis satu klien.
+
+BAST_SAMPLE_MD = """BERITA ACARA SERAH TERIMA (BAST)
+
+Nama Pekerjaan Pengadaan Access Point Kebutuhan Dinas Contoh
+Tanggal PO / Kontrak 10 Januari 2031
+Nomor PO / Kontrak 210/00/BIS-01/BUT/2031
+
+Pada hari ini, Senin Tanggal Sepuluh Bulan Februari Tahun 2031, kami yang bertanda tangan di bawah ini:
+
+PIHAK PERTAMA
+Nama Rina Kartika
+Perusahaan Dinas Komunikasi dan Informatika
+Jabatan Kepala Bidang Infrastruktur
+
+PIHAK KEDUA
+Nama Bayu Pratama
+Perusahaan PT Contoh Jaringan Sejahtera
+Jabatan Direktur
+
+dengan rincian sebagai berikut:
+
+| No | Deskripsi | Volume | Satuan | Keterangan |
+|---|---|---|---|---|
+| 1 | Access Point Wi-Fi 6 Indoor | 10 | Unit | |
+| 2 | Kabel UTP Cat6 | 100 | Meter | |
+
+Dokumen pendukung:
+1. Purchase Order (PO)/Kontrak
+2. Delivery Order (DO)/Surat Jalan
+
+PIHAK KEDUA menyatakan bahwa barang telah diterima dalam kondisi baik, lengkap, dan sesuai dengan dokumen PO/Kontrak."""
+
+
+def test_classifier_detects_bast():
+    doc_type, conf = DocumentClassifier().classify_fast_rule(BAST_SAMPLE_MD)
+    assert doc_type == "bast" and conf >= 0.95
+
+
+def test_table_extractor_handles_bast_tables_without_price_columns():
+    from app.parsers.table_extractor import extract_items_from_markdown_tables
+
+    items = extract_items_from_markdown_tables(BAST_SAMPLE_MD, doc_type="bast")
+    assert len(items) == 2
+    assert items[0]["No"] == "1"
+    assert items[0]["Deskripsi"] == "Access Point Wi-Fi 6 Indoor"
+    assert items[0]["Volume"] == 10.0
+    assert items[0]["Satuan"] == "Unit"
+    assert items[1]["No"] == "2"
+
+
+def test_bast_schema_validates_full_and_minimal_data():
+    from app.schemas.bast import BASTExtractionSchema
+
+    full = {
+        "Nomor BAST": None, "Nama Pekerjaan": "Pengadaan Access Point",
+        "Nomor PO / Kontrak": "210/00/BIS-01/BUT/2031", "Tanggal PO / Kontrak": "10 Januari 2031",
+        "Tanggal Serah Terima": "10 Februari 2031",
+        "Pihak Pertama": {"Nama Perusahaan": "Dinas Contoh", "Nama Representative": "Rina Kartika", "Jabatan": "Kepala Bidang", "Alamat": None},
+        "Pihak Kedua": {"Nama Perusahaan": "PT Contoh Jaringan Sejahtera", "Nama Representative": "Bayu Pratama", "Jabatan": "Direktur", "Alamat": None},
+        "Daftar Barang/Pekerjaan Diserahkan": [{"No": "1", "Deskripsi": "Access Point", "Volume": 10, "Satuan": "Unit"}],
+        "Nilai Pengadaan": None, "Pernyataan Penerimaan": "diterima dalam kondisi baik",
+        "Tanggal Uji Terima": None, "Hasil Uji Terima Keseluruhan": None, "Dokumen Pendukung": ["PO/Kontrak"],
+    }
+    extracted = BASTExtractionSchema.model_validate(full)
+    assert extracted.nomor_bast is None and extracted.items[0].deskripsi == "Access Point"
+
+    # Minimal: BAST tanpa nomor sendiri dan tanpa detail pejabat -- harus tetap valid (tidak crash).
+    minimal = {
+        "Pihak Pertama": {"Nama Perusahaan": "Dinas Contoh"},
+        "Pihak Kedua": {"Nama Perusahaan": "PT Contoh"},
+        "Daftar Barang/Pekerjaan Diserahkan": [],
+    }
+    extracted_min = BASTExtractionSchema.model_validate(minimal)
+    assert extracted_min.items == [] and extracted_min.pihak_pertama.jabatan is None
+
+
+def test_validate_bast_flags_identical_parties_and_bad_date_order():
+    data = {
+        "Pihak Pertama": {"Nama Perusahaan": "PT Sama", "Alamat": "Jl. Sama"},
+        "Pihak Kedua": {"Nama Perusahaan": "PT Sama", "Alamat": "Jl. Sama"},
+        "Tanggal PO / Kontrak": "10 Februari 2031", "Tanggal Serah Terima": "5 Januari 2031",
+        "Daftar Barang/Pekerjaan Diserahkan": [{"Deskripsi": "Item A"}],
+    }
+    from app.validation.rules import validate_bast
+
+    report = validate_bast(data)
+    rules = {i.rule for i in report.issues}
+    assert "parties_distinct" in rules
+    assert "serah_terima_after_po_kontrak" in rules
+    assert report.status == "fail"
+
+
+def test_validate_bast_passes_on_clean_document():
+    from app.validation.rules import validate_bast
+
+    data = {
+        "Pihak Pertama": {"Nama Perusahaan": "Dinas Contoh", "Alamat": "Jl. A"},
+        "Pihak Kedua": {"Nama Perusahaan": "PT Vendor Contoh", "Alamat": "Jl. B"},
+        "Nomor PO / Kontrak": "210/00/BIS-01/BUT/2031", "Nama Pekerjaan": "Pengadaan Access Point",
+        "Tanggal PO / Kontrak": "10 Januari 2031", "Tanggal Serah Terima": "10 Februari 2031",
+        "Daftar Barang/Pekerjaan Diserahkan": [{"Deskripsi": "Access Point", "Volume": 10, "Satuan": "Unit"}],
+    }
+    assert validate_bast(data).status == "pass"
+
+
+def test_engine_dispatches_bast_extraction_without_llm_call():
+    """Verifikasi routing engine.extract() -> extractor.extract_bast(), bukan fallback ke kontrak."""
+    from app.services.engine import OpenADEEngine
+    from app.schemas.bast import BASTExtractionSchema
+
+    class _FakeExtractor:
+        llm_calls = 0
+        llm_seconds = 0.0
+
+        def reset_stats(self):
+            pass
+
+        def extract_bast(self, markdown_text):
+            return BASTExtractionSchema.model_validate({
+                "Pihak Pertama": {"Nama Perusahaan": "A"}, "Pihak Kedua": {"Nama Perusahaan": "B"},
+                "Daftar Barang/Pekerjaan Diserahkan": [],
+            })
+
+    engine = OpenADEEngine()
+    engine._extractor = _FakeExtractor()
+    extracted, resolved = engine.extract(BAST_SAMPLE_MD, doc_type="bast")
+    assert resolved == "bast"
+    assert isinstance(extracted, BASTExtractionSchema)
+
+
+def test_classifier_detects_spmk_as_contract_family():
+    """
+    SPMK (Surat Perintah Mulai Kerja) -- ditemukan di 'Data Project BUT': perintah resmi
+    mulai bekerja yang diterbitkan setelah kontrak ditandatangani. User mengonfirmasi ini
+    harus dialurkan sebagai dokumen keluarga kontrak (skema yang sama seperti SPK), bukan
+    tipe terpisah. Sebelum perbaikan, skornya 0 di semua tipe (default fallback 0.70).
+    """
+    text = ("Perihal : Surat Perintah Mulai Kerja Pengadaan Tel-Urator 1000D Kebutuhan Polda Jabar\n"
+            "PT Belama Guna Daya kami tunjuk untuk melaksanakan proses pekerjaan Pengadaan Tel-Urator 1000D")
+    doc_type, conf = DocumentClassifier().classify_fast_rule(text)
+    assert doc_type == "contract" and conf >= 0.95
