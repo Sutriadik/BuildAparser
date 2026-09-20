@@ -8,34 +8,23 @@ tinggi palsu dan LLM cenderung menyalin nilai contoh (mis. "Bank Mandiri") ke do
 Naikkan PROMPT_VERSION setiap kali prompt diubah agar hasil evaluasi bisa dibandingkan.
 """
 
-PROMPT_VERSION = "extract-2026.09.2"
+PROMPT_VERSION = "extract-2026.09.3"
 
 CONTRACT_EXTRACTION_SYSTEM_PROMPT = """Anda adalah AI Document Extraction Engine untuk dokumen kontrak pengadaan Indonesia dalam berbagai bentuk: Surat Perintah Kerja (SPK), Kontrak/Perjanjian Kerja Sama (PKS), dan Nota/Surat Pesanan.
 
-ATURAN UTAMA & EKSTRAKSI TABEL FLEKSIBEL:
-1. EKSTRAK SELURUH BARIS ITEM: Setiap baris rincian barang, jasa, atau pekerjaan yang ada di tabel dokumen WAJIB diekstrak ke dalam 'List Item/Barang'. DILARANG melewatkan baris item!
-2. NOMOR URUT ITEM ('Nomor Item') VS DESKRIPSI:
-   - 'Nomor Item' wajib diisi dengan urutan nomor ("1", "2", "3", dst.).
-   - PISAHKAN nomor urut dari deskripsi: DILARANG memasukkan nomor urut item ke dalam teks 'Deskripsi Item/Barang/Pekerjaan'! Contoh: jika di tabel tertulis "1 Penyediaan Fortigate 200f", maka 'Nomor Item' = "1" dan 'Deskripsi' = "Penyediaan Fortigate 200f" (BUKAN "1 Penyediaan Fortigate 200f").
-   - Jika tertulis "3SSL" atau "4APJII", pisahkan menjadi Nomor: "3", Deskripsi: "SSL", dan Nomor: "4", Deskripsi: "APJII".
-3. DILARANG MEMASUKKAN SUBTOTAL/GRANDTOTAL SEBAGAI ITEM:
-   - Baris ringkasan harga seperti "Subtotal (Sebelum PPN)", "Grandtotal", "Total A+B" BUKAN item barang/pekerjaan!
-   - JANGAN masukkan baris Subtotal/Grandtotal ke dalam 'List Item/Barang'. Masukkan nilainya hanya ke 'sub total' dan 'Total Harga Pekerjaan'.
-4. REDAKSI LENGKAP 100% (FULL UNABRIDGED REDACTION):
-   - Salin seluruh kalimat, rincian sub-bullet (-), dan uraian teknis pada kolom deskripsi/pekerjaan secara UTUH VERBATIM.
-   - DILARANG memotong, menyingkat, atau merangkum redaksi tabel!
-5. STRUKTUR HIERARKI & KATEGORI TABEL:
-   - Jika tabel memiliki sub-header/kelompok (misal: "A. Tenaga Ahli", "A CPE License", "Hardware", "Jasa"), isi field 'Kategori/Kelompok' dengan nama kategori tersebut (misal: "A. CPE License") untuk seluruh baris item di bawahnya.
-6. KOLOM FLEKSIBEL & ATRIBUT TAMBAHAN:
-   - 'Periode/Durasi': Isi jika ada kolom durasi/periode (misal: "12 (Bln)", "12", "12 Bulan", "30 Hari").
-   - 'Spesifikasi': Isi dengan rincian teknis, part number, atau cakupan fitur jika tersedia.
-   - 'Harga Satuan' & 'Jumlah Harga': Isi dengan nominal angka harga satuan dan harga total item (jika ada OTC dan MRC bulanan, isi harga total pekerjaan atau MRC).
-   - 'Atribut Tambahan': Masukkan kolom-kolom non-standar lainnya dalam bentuk dictionary key-value jika ada.
-   - 'Keterangan': Isi jika terdapat catatan khusus.
-7. FORMAT ANGKA INDONESIA: Titik (.) adalah pemisah ribuan, BUKAN desimal. "12.000.000" = 12000000, "48.000.000" = 48000000. JANGAN konversi ke desimal!
-8. Teks mungkin mengandung typo OCR. Baca konteks untuk memahami maksudnya.
-9. Baca SELURUH teks sampai akhir sebelum menjawab.
-10. Keluarkan HANYA JSON yang valid.
+ATURAN UTAMA:
+1. FORMAT ANGKA INDONESIA: Titik (.) adalah pemisah ribuan, BUKAN desimal. "12.000.000" = 12000000. JANGAN konversi ke desimal!
+2. REDAKSI VERBATIM: Salin kalimat klausul secara UTUH. DILARANG memotong, menyingkat, atau merangkum.
+3. Teks mungkin mengandung typo OCR. Baca konteks untuk memahami maksudnya.
+4. Baca SELURUH teks sampai akhir sebelum menjawab.
+5. Keluarkan HANYA JSON yang valid.
+
+CATATAN TABEL: baris item/BoQ diambil secara deterministik oleh parser, JANGAN mengeluarkannya.
+Kalau (dan hanya kalau) diminta khusus untuk menyusun/melengkapi baris item, berlaku aturan ini:
+- Pisahkan nomor urut dari deskripsi ("1 Penyediaan Fortigate 200f" -> Nomor "1", Deskripsi "Penyediaan Fortigate 200f").
+- Baris ringkasan ("Subtotal", "Grandtotal", "Total A+B") BUKAN item.
+- 'Kategori/Kelompok' diisi nama sub-header tabel (misal "A. CPE License") untuk baris di bawahnya.
+- 'Periode/Durasi', 'Spesifikasi', 'Keterangan', 'Atribut Tambahan' diisi bila kolomnya tersedia.
 
 PANDUAN DETAIL PER-FIELD (BACA DENGAN TELITI DAN LOGIS):
 - "Pihak Pertama": Pihak Pemberi Perintah Kerja / Klien / Pemilik Pengadaan / Pemesan.
@@ -84,16 +73,23 @@ PANDUAN FIELD LAINNYA:
 - "Jumlah Terbilang": Kalimat terbilang rupiah, disalin utuh tanpa ada kata yang hilang.
 - "Garansi": Klausul garansi / SLA jika ada.
 - "Syarat Lampiran Wajib BAST": Dokumen lampiran wajib saat BAST, hanya jika disebutkan eksplisit.
+- "Daftar Nomor Kontrak": Daftar seluruh nomor kontrak yang tertera pada dokumen.
+- "Dokumen Pendukung": Daftar surat penetapan, berita acara rapat, atau surat kesanggupan yang mendasari kontrak pada konsiderans awal.
+- "Daftar Pasal Kontrak": Daftar seluruh nomor dan judul pasal yang ada dalam kontrak (misal: [{"Nomor Pasal": "Pasal 1", "Judul Pasal": "LINGKUP PEKERJAAN"}, ...]).
+- "Ketentuan Pembayaran": Daftar butir-butir ketentuan / tata cara pembayaran dari pasal Cara Pembayaran.
+- "Daftar Penandatangan": Daftar nama dan jabatan penandatangan dari bagian akhir dokumen.
+- "Klausul Jaminan": Rincian nomor pasal dan uraian jaminan pelaksanaan / garansi jika ada.
+- "Informasi Bea Meterai": Uraian ketentuan meterai dan pajak dari pasal terkait.
 
 CONTOH FORMAT (DATA FIKTIF — JANGAN DISALIN):
 ---
 Input: "...SURAT PERINTAH KERJA Nomor : 045/SPK/LOG-02/2031
 Berdasarkan hasil negosiasi harga pada tanggal 10 Maret 2031 tentang Pengadaan Switch Access dan Jaringan Kampus...
-Nama : Rina Kartika
+Nama : Rina Kartika, NPWP: 01.000.013.1-093.000
 Jabatan : Kepala Divisi Logistik
 Alamat : Gedung Arunika Lt. 3, Jl. Merpati Raya No. 18, Semarang
 Yang dalam hal ini mewakili secara sah : PT SAMUDRA CONTOH NUSANTARA, selanjutnya disebut sebagai PIHAK PERTAMA, memberi perintah kerja Pengadaan Switch Access dan Jaringan Kampus kepada :
-Nama : Bayu Pratama
+Nama : Bayu Pratama, NPWP: 0211.1642.9944.1000
 Jabatan : Direktur Utama
 Alamat : Jl. Kenanga No. 7, Surakarta
 Yang dalam hal ini mewakili secara sah : CV. DATA CONTOH MANDIRI, selanjutnya disebut sebagai PIHAK KEDUA...
@@ -106,10 +102,12 @@ Dibuat di : Semarang, Tanggal : 14 Maret 2031"
 
 Output:
 {
-  "Pihak Pertama": {"Nama Perusahaan": "PT SAMUDRA CONTOH NUSANTARA", "Nama Representative": "Rina Kartika", "Jabatan": "Kepala Divisi Logistik", "Alamat": "Gedung Arunika Lt. 3, Jl. Merpati Raya No. 18, Semarang"},
-  "Pihak Kedua": {"Nama Perusahaan": "CV. DATA CONTOH MANDIRI", "Nama Representative": "Bayu Pratama", "Jabatan": "Direktur Utama", "Alamat": "Jl. Kenanga No. 7, Surakarta"},
+  "Pihak Pertama": {"Nama Perusahaan": "PT SAMUDRA CONTOH NUSANTARA", "NPWP": "01.000.013.1-093.000", "Nama Representative": "Rina Kartika", "Jabatan": "Kepala Divisi Logistik", "Alamat": "Gedung Arunika Lt. 3, Jl. Merpati Raya No. 18, Semarang"},
+  "Pihak Kedua": {"Nama Perusahaan": "CV. DATA CONTOH MANDIRI", "NPWP": "0211.1642.9944.1000", "Nama Representative": "Bayu Pratama", "Jabatan": "Direktur Utama", "Alamat": "Jl. Kenanga No. 7, Surakarta"},
   "List Item/Barang": [{"Nomor Item": "1", "Kategori/Kelompok": null, "Deskripsi Item/Barang/Pekerjaan": "Switch Access 24 Port", "Spesifikasi": null, "volume": 4, "unit": "unit", "Periode/Durasi": null, "Harga Satuan": 12000000, "Jumlah Harga": 48000000, "Keterangan": null, "Atribut Tambahan": null}],
   "Nomor Kontrak Kerja": "045/SPK/LOG-02/2031",
+  "Nomor Kontrak Internal": null,
+  "Daftar Nomor Kontrak": ["045/SPK/LOG-02/2031"],
   "Tanggal Negosiasi": "2031-03-10",
   "Nama Pekerjaan": "Pengadaan Switch Access dan Jaringan Kampus",
   "persentase ppn": "11%",
@@ -120,6 +118,7 @@ Output:
   "Nomor Rekening Bank": null,
   "Nama Rekening Bank": null,
   "Mekanisme Skema Pembayaran": null,
+  "Ketentuan Pembayaran": null,
   "Persentase Sanksi/Penalti": null,
   "Lokasi": "Semarang",
   "Tanggal Pembuatan Dokumen": "14 Maret 2031",
@@ -128,7 +127,13 @@ Output:
   "Total Harga Pekerjaan": 53280000,
   "Jumlah Terbilang": "Lima Puluh Tiga Juta Dua Ratus Delapan Puluh Ribu Rupiah",
   "Garansi": null,
-  "Syarat Lampiran Wajib BAST": null
+  "Klausul Jaminan": null,
+  "Syarat Lampiran Wajib BAST": null,
+  "Dokumen Pendukung": null,
+  "Daftar Pasal Kontrak": [{"Nomor Pasal": "1", "Judul Pasal": "LINGKUP PEKERJAAN"}],
+  "Daftar Penandatangan": [{"Nama": "Rina Kartika", "Jabatan": "Kepala Divisi Logistik"}, {"Nama": "Bayu Pratama", "Jabatan": "Direktur Utama"}],
+  "Informasi Bea Meterai": null,
+  "Daftar Tabel Terstruktur": null
 }
 ---
 Sekarang ekstrak dokumen berikut dengan akurasi, logika, dan ketelitian yang sama."""
@@ -252,23 +257,21 @@ Petunjuk pencarian:
 - "Tanggal Pembuatan Dokumen": Cari "Tanggal ..." setelah "Dibuat di" di akhir dokumen
 - "Total PPN": Nominal PPN (jika PPN 11% dari subtotal, hitung selisih Total - Sub Total)
 
-Berikut teks dokumen lengkap:
-
-{markdown_text}
-
-Ekstrak field-field tersebut ke dalam JSON sesuai schema."""
+Keluarkan HANYA JSON berisi field-field di atas — jangan ulangi field yang sudah terisi, dan
+jangan keluarkan daftar item/tabel. Gunakan nama field persis seperti di atas. Untuk field
+bersarang, susun bersarang juga, contoh: {{"Pihak Pertama": {{"Alamat": "..."}}}}.
+Jika sebuah field memang tidak ada di dokumen, isi null."""
 
 
 SPH_RETRY_PROMPT_TEMPLATE = """Ekstraksi sebelumnya menghasilkan field-field berikut yang masih KOSONG/NULL:
 {null_fields}
 
-Baca ulang teks dokumen dengan TELITI dan ekstrak field-field tersebut.
+Baca ulang dokumen di atas dengan TELITI dan ekstrak field-field tersebut.
 
-Berikut teks dokumen lengkap:
-
-{markdown_text}
-
-Ekstrak HANYA field-field yang sebelumnya null ke dalam JSON sesuai schema."""
+Keluarkan HANYA JSON berisi field-field di atas — jangan ulangi field yang sudah terisi, dan
+jangan keluarkan daftar item/tabel. Gunakan nama field persis seperti di atas. Untuk field
+bersarang, susun bersarang juga, contoh: {{"Vendor": {{"NPWP": "..."}}}}.
+Jika sebuah field memang tidak ada di dokumen, isi null."""
 
 
 # ===========================================================================
@@ -345,10 +348,9 @@ Sekarang ekstrak dokumen berikut dengan akurasi dan kelengkapan yang sama."""
 BAST_RETRY_PROMPT_TEMPLATE = """Ekstraksi sebelumnya menghasilkan field-field berikut yang masih KOSONG/NULL:
 {null_fields}
 
-Baca ulang teks dokumen dengan TELITI. Jika field memang benar-benar tidak ada di dokumen (misal dokumen tidak memuat bagian "Berita Acara Uji Terima"), biarkan null -- jangan mengarang.
+Baca ulang dokumen di atas dengan TELITI. Jika field memang benar-benar tidak ada di dokumen (misal dokumen tidak memuat bagian "Berita Acara Uji Terima"), biarkan null -- jangan mengarang.
 
-Berikut teks dokumen lengkap:
-
-{markdown_text}
-
-Ekstrak field-field tersebut ke dalam JSON sesuai schema."""
+Keluarkan HANYA JSON berisi field-field di atas — jangan ulangi field yang sudah terisi, dan
+jangan keluarkan daftar item/tabel. Gunakan nama field persis seperti di atas. Untuk field
+bersarang, susun bersarang juga, contoh: {{"Pihak Kedua": {{"NPWP": "..."}}}}.
+Jika sebuah field memang tidak ada di dokumen, isi null."""

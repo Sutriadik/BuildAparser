@@ -14,6 +14,7 @@ from app.config import config
 
 CLASSIFY_WINDOW_CHARS = 3000
 TITLE_WINDOW_CHARS = 600
+REST_WEIGHT = 0.5  # bobot kata kunci di luar halaman awal (berkas gabungan)
 
 _RULES: Dict[str, List[Tuple[str, float]]] = {
     "contract": [
@@ -31,6 +32,12 @@ _RULES: Dict[str, List[Tuple[str, float]]] = {
         (r"\bPERJANJIAN\s+KERJA\s*SAMA\b", 3.0), (r"\bPERJANJIAN\b", 2.0), (r"\bPKS\b", 2.0),
         (r"\bKONTRAK\s+LAYANAN\b", 2.5), (r"\bKONTRAK\s+PENGADAAN\b", 2.5), (r"\bKONTRAK\b", 0.75),
         (r"\bNOTA\s+PESANAN\b", 3.0), (r"\bSURAT\s+PESANAN\b", 3.0), (r"\bPURCHASE\s+ORDER\b", 1.5),
+        # Berita Acara Klarifikasi/Negosiasi (BAK) adalah dokumen penetapan harga hasil
+        # negosiasi; di lapangan ia jadi halaman muka berkas kontrak (Nota Pesanan/SPK ada di
+        # halaman berikutnya), jadi dialurkan ke schema kontrak -- bukan BAST (serah terima)
+        # dan bukan SPH (penawaran sepihak dari vendor).
+        (r"\bBERITA\s+ACARA\s+KLARIFIKASI\b", 3.0), (r"\bBERITA\s+ACARA\s+NEGO(?:SIASI)?\b", 3.0),
+        (r"\bKLARIFIKASI\s+DAN\s+NEGOSIASI\b", 3.0), (r"\bHASIL\s+NEGOSIASI\b", 1.5),
     ],
     "sph": [
         (r"\bSURAT\s+PENAWARAN\s+HARGA\b", 3.0), (r"\bSPH\b", 2.0), (r"\bPENAWARAN\s+HARGA\b", 2.5),
@@ -67,8 +74,19 @@ class DocumentClassifier:
 
     @staticmethod
     def score_types(text: str) -> Dict[str, float]:
-        window = text[:CLASSIFY_WINDOW_CHARS].upper()
+        """
+        Tiga lapis bobot: judul/kop > halaman awal > sisa dokumen.
+
+        Lapis ketiga penting untuk berkas gabungan: dokumen kontrak sering dikirim sebagai
+        satu PDF dengan Berita Acara Negosiasi di depan dan Nota Pesanan/SPK di halaman
+        tengah. Tanpa lapis ini, tipe seluruh berkas ditentukan oleh 3.000 karakter pertama
+        saja -- satu kemunculan "Penawaran Harga" di posisi 2.983 pernah membuat berkas
+        kontrak 9 halaman terklasifikasi sebagai SPH.
+        """
+        upper = text.upper()
+        window = upper[:CLASSIFY_WINDOW_CHARS]
         title = window[:TITLE_WINDOW_CHARS]
+        rest = upper[CLASSIFY_WINDOW_CHARS:]
         scores: Dict[str, float] = {}
         for doc_type, patterns in _RULES.items():
             score = 0.0
@@ -77,6 +95,8 @@ class DocumentClassifier:
                     score += weight * 1.5  # kata kunci di judul/kop jauh lebih bermakna
                 elif re.search(pattern, window):
                     score += weight
+                elif re.search(pattern, rest):
+                    score += weight * REST_WEIGHT
             scores[doc_type] = score
         return scores
 
@@ -111,7 +131,11 @@ class DocumentClassifier:
                 messages=[{"role": "system", "content": system_prompt},
                           {"role": "user", "content": f"Cuplikan halaman awal dokumen:\n\n{markdown_text[:2000]}\n\nTentukan tipe dokumen dalam JSON."}],
                 format=DocumentClassificationResult.model_json_schema(),
-                options={"temperature": 0.0, "seed": config.OLLAMA_SEED, "num_ctx": 4096},
+                # num_ctx WAJIB sama dengan yang dipakai extractor. Nilai berbeda memaksa
+                # Ollama mengalokasi ulang konteks model, yang membuang KV-cache dan
+                # memperlambat panggilan ekstraksi berikutnya.
+                options={"temperature": 0.0, "seed": config.OLLAMA_SEED, "num_ctx": config.OLLAMA_NUM_CTX},
+                keep_alive=config.OLLAMA_KEEP_ALIVE,
             )
             return DocumentClassificationResult.model_validate_json(response["message"]["content"])
         except Exception:

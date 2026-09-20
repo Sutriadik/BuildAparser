@@ -42,11 +42,18 @@ class BASTExtractionSchema(BaseModel):
     nomor_po_kontrak: Optional[str] = Field(None, alias="Nomor PO / Kontrak", description="Nomor PO/SPK/Kontrak/Nota Pesanan rujukan yang mendasari BAST")
     tanggal_po_kontrak: Optional[str] = Field(None, alias="Tanggal PO / Kontrak", description="Tanggal PO/SPK/Kontrak rujukan")
     tanggal_serah_terima: Optional[str] = Field(None, alias="Tanggal Serah Terima", description="Tanggal pelaksanaan serah terima (format: YYYY-MM-DD atau teks asli)")
+    tanggal_aktivasi_layanan: Optional[str] = Field(
+        None, alias="Tanggal Aktivasi Layanan",
+        description="Tanggal layanan mulai aktif/berjalan (misal kalimat 'Layanan telah aktif sejak ...'), "
+                     "relevan untuk layanan berlangganan/recurring. Null jika dokumen tidak menyebutkannya."
+    )
 
     pihak_pertama: PihakDetail = Field(..., alias="Pihak Pertama", description="Pihak penerima barang/pekerjaan (Pemberi Kerja / Klien / Pemesan). Kadang disebut PIHAK KESATU")
     pihak_kedua: PihakDetail = Field(..., alias="Pihak Kedua", description="Pihak penyedia/pelaksana yang menyerahkan barang/pekerjaan")
 
-    items: List[BASTItemDetail] = Field(..., alias="Daftar Barang/Pekerjaan Diserahkan", description="Rincian seluruh baris barang/pekerjaan pada tabel serah terima")
+    # default_factory: baris tabel diisi deterministik dari parser (_reconcile_bast_items), jadi
+    # pass-1 LLM tidak perlu mengetik ulang seluruh tabel serah terima.
+    items: List[BASTItemDetail] = Field(default_factory=list, alias="Daftar Barang/Pekerjaan Diserahkan", description="Rincian seluruh baris barang/pekerjaan pada tabel serah terima")
 
     nilai_pengadaan: Optional[float] = Field(None, alias="Nilai Pengadaan", description="Nilai total pengadaan/pekerjaan dalam Rupiah, jika dicantumkan di BAST")
     pernyataan_penerimaan: Optional[str] = Field(None, alias="Pernyataan Penerimaan", description="Kalimat pernyataan kondisi barang/hasil pekerjaan diterima (misal: 'diterima dalam kondisi baik, lengkap, dan sesuai')")

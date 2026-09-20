@@ -43,11 +43,16 @@ def _detect_severe_ocr_corruption(text: str) -> bool:
     """
     if not text:
         return False
-    # Pola kata 1-huruf acak berulang minimal 4 huruf berturut-turut: "a a al a aan" atau "ea a a"
-    if re.search(r'\b[a-z]{1,2}\s+[a-z]{1,2}\s+[a-z]{1,2}\s+[a-z]{1,2}\b', text):
+    # Frasa rusak spesifik akibat OCR scan tinta pudar
+    known_corruptions = (
+        "ber aal ana", "ea a a", "al a aan", "eran dan de da", "daleas an a a",
+        "ssels e- as", "pean ean e e", "kamy i u s", "dva a aaa", "menn aan mannan"
+    )
+    text_lower = text.lower()
+    if any(p in text_lower for p in known_corruptions):
         return True
-    # Frasa rusak spesifik OCR yang diketahui
-    if any(p in text.lower() for p in ("ber aal ana", "ea a a", "al a aan")):
+    # Pola kata 1-2 huruf rumpang beruntun tanpa titik singkatan (bukan S.H. atau Jl. H.M.)
+    if re.search(r'\b(?:ea|al|aan|ana|sel|menn|pean)\s+[a-z]{1,2}\s+[a-z]{1,2}\s+[a-z]{1,2}\b', text_lower):
         return True
     return False
 
@@ -59,6 +64,7 @@ class MarkdownRefiner:
     def __init__(self):
         self.base_url = config.OLLAMA_BASE_URL.rstrip("/")
         self.model = config.OLLAMA_MODEL
+        self._client = None  # dibuat sekali, bukan per halaman
 
     def refine_markdown(self, markdown_text: str, force: bool = False) -> str:
         """
@@ -122,8 +128,9 @@ class MarkdownRefiner:
         prompt = f"Berikut teks dokumen Markdown yang perlu diperbaiki ejaan dan keterbacaannya:\n\n{page_text}\n\nKembalikan HANYA teks Markdown hasil perbaikan tanpa penjelasan apapun:"
         
         try:
-            client = ollama.Client(host=self.base_url, timeout=config.OLLAMA_TIMEOUT)
-            resp = client.chat(
+            if self._client is None:
+                self._client = ollama.Client(host=self.base_url, timeout=config.OLLAMA_TIMEOUT)
+            resp = self._client.chat(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": MARKDOWN_REFINER_SYSTEM_PROMPT},
@@ -132,9 +139,12 @@ class MarkdownRefiner:
                 options={
                     "temperature": 0.0,
                     "seed": config.OLLAMA_SEED,
+                    # num_ctx & keep_alive harus seragam dengan classifier/extractor, kalau
+                    # tidak Ollama mengalokasi ulang konteks model di tengah pipeline.
                     "num_ctx": config.OLLAMA_NUM_CTX,
-                    "num_predict": 4096,
-                }
+                    "num_predict": config.OLLAMA_NUM_PREDICT,
+                },
+                keep_alive=config.OLLAMA_KEEP_ALIVE,
             )
             content = resp.get("message", {}).get("content", "").strip()
             # Hapus markdown code fences jika model menyertakannya

@@ -55,13 +55,16 @@ class SPHExtractionSchema(BaseModel):
     jangka_waktu_pengiriman: Optional[str] = Field(None, alias="Jangka Waktu Pengiriman", description="Waktu pelaksanaan atau pengiriman barang")
     lokasi_pekerjaan: Optional[str] = Field(None, alias="Lokasi Pekerjaan", description="Lokasi instalasi/pekerjaan")
     
-    items: List[SPHItemDetail] = Field(..., alias="Daftar Penawaran Harga", description="Rincian lengkap seluruh baris item penawaran (BoQ)")
+    # default_factory: baris tabel diisi deterministik dari parser (_reconcile_items), jadi
+    # pass-1 LLM tidak perlu mengetik ulang seluruh BoQ.
+    items: List[SPHItemDetail] = Field(default_factory=list, alias="Daftar Penawaran Harga", description="Rincian lengkap seluruh baris item penawaran (BoQ)")
     
     subtotal: float = Field(..., alias="Subtotal", description="Total sebelum PPN")
     persentase_ppn: Optional[str] = Field("11%", alias="Persentase PPN", description="Persentase PPN")
     ppn_nominal: Optional[float] = Field(0.0, alias="Nilai PPN", description="Nominal PPN")
     grand_total: float = Field(..., alias="Grand Total", description="Total akhir penawaran termasuk pajak")
-    
+    jumlah_terbilang: Optional[str] = Field(None, alias="Jumlah Terbilang", description="Nominal grand total penawaran yang ditulis dalam kata-kata, jika dicantumkan di dokumen")
+
     mekanisme_pembayaran: Optional[str] = Field(None, alias="Mekanisme Skema Pembayaran", description="Termin pembayaran yang ditawarkan")
     garansi_layanan: Optional[str] = Field(None, alias="Garansi / SLA", description="Garansi produk atau SLA layanan yang ditawarkan")
     catatan_khusus: Optional[str] = Field(None, alias="Catatan Khusus", description="Syarat dan ketentuan tambahan dari vendor")

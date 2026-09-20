@@ -47,7 +47,17 @@ PLACEHOLDER_PATTERNS = (
     "not found", "n/a",
 )
 SUMMARY_ROW = re.compile(r"^(?:sub\s*total|grand\s*total|total\s*[a-z0-9+]*|jumlah\s*total|total\s*keseluruhan)\b", re.IGNORECASE)
-NULL_COUNT_SKIP = {"Daftar Tabel Terstruktur"}
+# Field yang diisi deterministik dari tabel hasil parser (extract_items_from_markdown_tables /
+# extract_tables_from_markdown + _reconcile_items). Field ini dibuang dari schema pass-1 supaya
+# LLM tidak menghabiskan ribuan token output mengetik ulang tabel yang sudah kita miliki —
+# pada dokumen uji, dua field ini saja menyumbang 69% token output.
+DETERMINISTIC_FIELDS = (
+    "List Item/Barang", "Daftar Penawaran Harga", "Daftar Barang/Pekerjaan Diserahkan",
+    "Daftar Tabel Terstruktur",
+)
+# Field deterministik tidak boleh ikut menghitung rasio null — kalau ikut, `items` yang masih
+# kosong saat pass-1 akan memicu retry yang tidak perlu.
+NULL_COUNT_SKIP = set(DETERMINISTIC_FIELDS)
 CHARS_PER_TOKEN = 3.0  # estimasi kasar untuk teks Indonesia pada tokenizer Qwen
 
 
@@ -73,6 +83,10 @@ class OllamaExtractor:
         self.context_analyzer = ContextAnalyzer()
         self.llm_calls = 0
         self.llm_seconds = 0.0
+        # Prefix dokumen terakhir, dipakai ulang oleh extract_* agar panggilan susulan
+        # (pengisian item / kolom opsional) tetap kena KV-cache Ollama.
+        self._doc_text: str = ""
+        self._system_prompt: str = ""
 
     # ------------------------------------------------------------------ LLM plumbing
     def reset_stats(self) -> None:
@@ -100,20 +114,58 @@ class OllamaExtractor:
             ) from e
         except httpx.ConnectError as e:
             raise ConnectionError(f"Tidak bisa terhubung ke Ollama di {self.base_url}. Buka aplikasi Ollama atau jalankan `ollama serve`.") from e
+        elapsed = time.time() - started
         self.llm_calls += 1
-        self.llm_seconds += time.time() - started
+        self.llm_seconds += elapsed
+        # Rincian prefill vs decode: satu-satunya cara melihat apakah KV-cache Ollama kena.
+        # prefill besar berulang = prefix prompt berubah (lihat _doc_first_messages).
+        p_tok, p_ns = response.get("prompt_eval_count", 0), response.get("prompt_eval_duration", 0) or 1
+        e_tok, e_ns = response.get("eval_count", 0), response.get("eval_duration", 0) or 1
+        logger.info(
+            f"   ⏱  prefill {p_tok} tok/{p_ns / 1e9:.1f}s ({p_tok / (p_ns / 1e9):.0f} tok/s) · "
+            f"decode {e_tok} tok/{e_ns / 1e9:.1f}s ({e_tok / (e_ns / 1e9):.1f} tok/s) · total {elapsed:.1f}s"
+        )
         return response["message"]["content"]
 
-    def _extract_with_llm(self, system_prompt: str, user_prompt: str, schema_class: type) -> BaseModel:
-        content = self._chat(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            fmt=schema_class.model_json_schema(),
-        )
+    # --- prefix caching -------------------------------------------------
+    # Ollama me-reuse KV-cache selama prefix token sebuah prompt identik dengan panggilan
+    # sebelumnya. Pada mesin M4 ini, dokumen 6.400 token butuh ~41 detik untuk di-prefill;
+    # kalau prefix-nya sama persis, panggilan berikutnya hanya ~0,3 detik.
+    #
+    # Karena itu SEMUA panggilan untuk satu dokumen memakai susunan yang sama:
+    #     system = system_prompt   (tetap)
+    #     user   = <dokumen>  +  "--- TUGAS: ..."   (dokumen dulu, tugas DI AKHIR)
+    #
+    # Menaruh tugas/daftar field di depan dokumen akan mengubah prefix dan membuang
+    # ~41 detik per panggilan. Jangan dibalik.
+    @staticmethod
+    def _doc_first_messages(system_prompt: str, doc_text: str, task: str) -> List[Dict[str, str]]:
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{doc_text}\n\n---\nTUGAS:\n{task}"},
+        ]
+
+    @staticmethod
+    def _slim_schema(schema_class: type, drop_fields: Tuple[str, ...]) -> Dict[str, Any]:
+        """JSON-schema tanpa field yang diisi deterministik, agar LLM tidak mengetik ulang tabel."""
+        schema = schema_class.model_json_schema()
+        props = schema.get("properties", {})
+        for alias in drop_fields:
+            props.pop(alias, None)
+        if "required" in schema:
+            schema["required"] = [r for r in schema["required"] if r not in drop_fields]
+        return schema
+
+    def _extract_with_llm(self, system_prompt: str, doc_text: str, task: str, schema_class: type,
+                          drop_fields: Tuple[str, ...] = ()) -> BaseModel:
+        fmt = self._slim_schema(schema_class, drop_fields) if drop_fields else schema_class.model_json_schema()
+        content = self._chat(self._doc_first_messages(system_prompt, doc_text, task), fmt=fmt)
         return schema_class.model_validate_json(content)
 
-    def _ask_json(self, prompt: str) -> Dict[str, Any]:
+    def _ask_json(self, system_prompt: str, doc_text: str, task: str) -> Dict[str, Any]:
+        """Panggilan JSON bebas-skema yang tetap memakai prefix dokumen yang sama (cache hit)."""
         try:
-            content = self._chat([{"role": "user", "content": prompt}], fmt="json")
+            content = self._chat(self._doc_first_messages(system_prompt, doc_text, task), fmt="json")
             start, end = content.find("{"), content.rfind("}")
             return json.loads(content[start:end + 1]) if start != -1 and end != -1 else {}
         except Exception as e:  # targeted scan bersifat best-effort
@@ -153,17 +205,34 @@ class OllamaExtractor:
 
     _is_placeholder_value = staticmethod(is_placeholder)
 
-    # ------------------------------------------------------------------ targeted clause slicing
+    # ------------------------------------------------------------------ targeted clause
     @staticmethod
-    def _slice_lines(lines: List[str], keywords: List[str], before: int, after: int, limit: int) -> str:
-        picked: List[str] = []
-        for i, line in enumerate(lines):
-            if any(kw in line.lower() for kw in keywords):
-                picked.extend(lines[max(0, i - before):min(len(lines), i + after)])
-        return "\n".join(list(dict.fromkeys(picked))[:limit])
+    def _only_null_keys(templates: Dict[str, Any], null_fields: List[str]) -> Dict[str, Any]:
+        """
+        Buang kunci template yang sudah terisi, tapi HANYA di level teratas.
 
-    def _run_targeted_groups(self, markdown_text: str, null_fields: List[str], groups: List[Dict[str, Any]]) -> Dict[str, Any]:
-        lines = markdown_text.splitlines()
+        Objek bersarang (mis. "Pihak Pertama") dikirim utuh walau cuma satu sub-field yang
+        null: memotongnya jadi satu sub-field saja membuat model kehilangan penanda untuk
+        membedakan Pihak Pertama dan Pihak Kedua, dan "Nama Representative" kedua pihak
+        jadi gagal terisi. Hematnya sedikit, ruginya besar.
+        """
+        return {
+            key: value for key, value in templates.items()
+            if key in null_fields or any(f.startswith(f"{key}.") for f in null_fields)
+        }
+
+    def _run_targeted_groups(self, system_prompt: str, doc_text: str,
+                             null_fields: List[str], groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Panggilan perbaikan untuk field yang masih null.
+
+        Dokumen penuh (`doc_text`) dipakai sebagai prefix supaya KV-cache Ollama kena
+        (prefill ~0,5 detik, bukan ~80 detik). Cuplikan klausul TIDAK ikut dikirim: dulu
+        cuplikan itu menggantikan dokumen, sekarang dokumennya sudah utuh di prefix, jadi
+        menempelkannya lagi hanya menduplikasi isi — sempat membengkakkan prompt targeted
+        dari 10.300 jadi 16.300 token dan memperlambat decode hampir dua kali lipat.
+        Arahan lokasi cukup lewat kalimat `task` tiap grup.
+        """
         triggered = [g for g in groups if g["trigger"](null_fields)]
         if not triggered:
             return {}
@@ -171,44 +240,44 @@ class OllamaExtractor:
         # Jika hanya 1 grup yang ter-trigger, jalankan langsung
         if len(triggered) == 1:
             g = triggered[0]
-            snippet = g["snippet"](lines)
-            if not snippet.strip():
-                return {}
-            prompt = (f"{g['intro']}\n\n{snippet}\n\n{g['task']}\n"
-                      f"Jika tidak ada di teks, isi null. Keluarkan JSON:\n{g['template']}")
-            result = self._ask_json(prompt)
+            task = (f"{g['intro']}\n{g['task']}\n"
+                    f"Jika tidak ada di dokumen, isi null. Keluarkan JSON:\n{g['template']}")
+            result = self._ask_json(system_prompt, doc_text, task)
             wrap = g.get("wrap")
             cleaned = {k: v for k, v in result.items() if not _is_empty(v) and not is_placeholder(v)}
             return {wrap: cleaned} if wrap and cleaned else cleaned
 
         # Jika banyak grup, gabungkan jadi SATU panggilan LLM terpadu (menghemat waktu secara drastis!)
-        snippets = []
-        templates = {}
+        intros, templates = [], {}
         for g in triggered:
-            snip = g["snippet"](lines)
-            if snip.strip():
-                snippets.append(f"--- {g['intro']} ---\n{snip}")
-                try:
-                    t_dict = json.loads(g["template"])
-                    if g.get("wrap"):
-                        templates[g["wrap"]] = t_dict
-                    else:
-                        templates.update(t_dict)
-                except Exception:
-                    pass
+            intros.append(f"- {g['intro']} {g['task']}")
+            try:
+                t_dict = json.loads(g["template"])
+                if g.get("wrap"):
+                    templates[g["wrap"]] = t_dict
+                else:
+                    templates.update(t_dict)
+            except Exception:
+                pass
 
-        if not snippets:
+        if not templates:
             return {}
 
-        combined_snippet = "\n\n".join(snippets)
+        # Hanya minta field yang memang masih null. Tanpa filter ini, satu grup yang terpicu
+        # menyeret seluruh field-nya (termasuk yang sudah terisi di pass 1) ke dalam output —
+        # decode adalah biaya terbesar yang tersisa, jadi tiap token output harus dibayar.
+        templates = self._only_null_keys(templates, null_fields)
+        if not templates:
+            return {}
+
         combined_template = json.dumps(templates, indent=2)
-        prompt = (
-            "Berikut cuplikan klausul-klausul relevan dari dokumen kontrak:\n\n"
-            f"{combined_snippet}\n\n"
-            "Tugas: Ekstrak seluruh field berikut dari teks di atas. Jika tidak ada di teks, isi null. "
+        task = (
+            "Beberapa field belum terisi. Cari langsung di dokumen di atas:\n"
+            + "\n".join(intros)
+            + "\n\nJika tidak ada di dokumen, isi null. "
             f"Keluarkan HANYA JSON sesuai format berikut:\n{combined_template}"
         )
-        result = self._ask_json(prompt)
+        result = self._ask_json(system_prompt, doc_text, task)
         cleaned = {}
         for k, v in result.items():
             if isinstance(v, dict):
@@ -219,68 +288,55 @@ class OllamaExtractor:
                 cleaned[k] = v
         return cleaned
 
-    def _extract_targeted_clauses(self, markdown_text: str, null_fields: List[str]) -> Dict[str, Any]:
-        def preamble(lines: List[str]) -> str:
-            idx = next((i for i, l in enumerate(lines) if re.search(r"PIHAK\s+KEDUA", l, re.IGNORECASE)), None)
-            return "\n".join(lines[:min(idx + 6, 90)] if idx is not None else lines[:50])
-
+    def _extract_targeted_clauses(self, system_prompt: str, doc_text: str,
+                                  null_fields: List[str]) -> Dict[str, Any]:
         groups = [
             {
                 "trigger": lambda nf: any(f.startswith("Pihak") for f in nf),
-                "snippet": preamble,
                 "intro": "Berikut pembuka/preamble dokumen kontrak:",
                 "task": "Tugas: Ekstrak Pihak Pertama (Pemberi Perintah / Klien) dan Pihak Kedua (Penyedia / Pelaksana). "
-                        "Masing-masing pihak punya alamat sendiri; jangan menduplikasi alamat.",
-                "template": '{"Pihak Pertama": {"Nama Perusahaan": "...", "Nama Representative": "...", "Jabatan": "...", "Alamat": "..."}, '
-                            '"Pihak Kedua": {"Nama Perusahaan": "...", "Nama Representative": "...", "Jabatan": "...", "Alamat": "..."}}',
+                        "Masing-masing pihak punya alamat sendiri; jangan menduplikasi alamat. Sertakan NPWP jika tertera.",
+                "template": '{"Pihak Pertama": {"Nama Perusahaan": "...", "NPWP": "...", "Nama Representative": "...", "Jabatan": "...", "Alamat": "..."}, '
+                            '"Pihak Kedua": {"Nama Perusahaan": "...", "NPWP": "...", "Nama Representative": "...", "Jabatan": "...", "Alamat": "..."}}',
             },
             {
-                "trigger": lambda nf: any(f in nf for f in ["Nama Bank", "Lokasi Cabang Bank", "Nomor Rekening Bank", "Nama Rekening Bank", "Mekanisme Skema Pembayaran"]),
-                "snippet": lambda lines: self._slice_lines(lines, ["bank", "rekening", "cabang", "a.n", "atas nama", "transfer", "pembayaran"], 2, 4, 30),
+                "trigger": lambda nf: any(f in nf for f in ["Nama Bank", "Lokasi Cabang Bank", "Nomor Rekening Bank", "Nama Rekening Bank", "Mekanisme Skema Pembayaran", "Ketentuan Pembayaran"]),
                 "intro": "Berikut cuplikan pasal CARA PEMBAYARAN dari dokumen kontrak:",
-                "task": "Tugas: Ekstrak Nama Bank, Lokasi Cabang Bank, Nomor Rekening Bank, Nama Rekening Bank, dan Mekanisme Skema Pembayaran.",
-                "template": '{"Nama Bank": "...", "Lokasi Cabang Bank": "...", "Nomor Rekening Bank": "...", "Nama Rekening Bank": "...", "Mekanisme Skema Pembayaran": "..."}',
+                "task": "Tugas: Ekstrak Nama Bank, Lokasi Cabang Bank, Nomor Rekening Bank, Nama Rekening Bank, Mekanisme Skema Pembayaran, dan butir-butir Ketentuan Pembayaran (array).",
+                "template": '{"Nama Bank": "...", "Lokasi Cabang Bank": "...", "Nomor Rekening Bank": "...", "Nama Rekening Bank": "...", "Mekanisme Skema Pembayaran": "...", "Ketentuan Pembayaran": ["..."]}',
             },
             {
-                "trigger": lambda nf: any(f in nf for f in ["Jangka Waktu", "Durasi Kerja", "Persentase Sanksi/Penalti", "Garansi", "Syarat Lampiran Wajib BAST"]),
-                "snippet": lambda lines: self._slice_lines(lines, ["jangka waktu", "delivery", "waktu pelaksanaan", "denda", "sanksi", "hari kalender", "bast", "serah terima", "garansi"], 2, 4, 30),
-                "intro": "Berikut cuplikan pasal WAKTU, DENDA/SANKSI, GARANSI, dan BAST dari dokumen kontrak:",
-                "task": "Tugas: Ekstrak Jangka Waktu, Durasi Kerja, Persentase Sanksi/Penalti, Garansi, dan Syarat Lampiran Wajib BAST.",
-                "template": '{"Jangka Waktu": "...", "Durasi Kerja": "...", "Persentase Sanksi/Penalti": "...", "Garansi": "...", "Syarat Lampiran Wajib BAST": ["..."]}',
+                "trigger": lambda nf: any(f in nf for f in ["Jangka Waktu", "Durasi Kerja", "Persentase Sanksi/Penalti", "Garansi", "Syarat Lampiran Wajib BAST", "Klausul Jaminan"]),
+                "intro": "Berikut cuplikan pasal WAKTU, DENDA/SANKSI, GARANSI, JAMINAN, dan BAST dari dokumen kontrak:",
+                "task": "Tugas: Ekstrak Jangka Waktu, Durasi Kerja, Persentase Sanksi/Penalti, Garansi, Klausul Jaminan, dan Syarat Lampiran Wajib BAST.",
+                "template": '{"Jangka Waktu": "...", "Durasi Kerja": "...", "Persentase Sanksi/Penalti": "...", "Garansi": "...", "Klausul Jaminan": {"Nomor Pasal": "...", "Uraian Jaminan": "..."}, "Syarat Lampiran Wajib BAST": ["..."]}',
             },
             {
-                "trigger": lambda nf: any(f in nf for f in ["Nomor Kontrak Kerja", "Nama Pekerjaan", "Tanggal Negosiasi"]),
-                "snippet": lambda lines: self._slice_lines(
-                    lines,
-                    ["nomor", "no.", "perintah kerja", "tentang", "lingkup pekerjaan", "pengadaan", "negosiasi", "lampiran", "judul"],
-                    2, 4, 40
-                ) or "\n".join(lines[:50]),
-                "intro": "Berikut cuplikan judul, nomor dokumen, pembuka (preamble), lingkup pekerjaan, dan lampiran dari dokumen kontrak:",
-                "task": "Tugas: Ekstrak Nomor Kontrak Kerja (nomor resmi SPK/Kontrak/PKS/Nota Pesanan, biasanya setelah kata 'Nomor :' atau 'Nomor K.' di bagian atas), Nama Pekerjaan (judul/lingkup pengadaan pekerjaan lengkap), dan Tanggal Negosiasi (jika ada).",
-                "template": '{"Nomor Kontrak Kerja": "...", "Nama Pekerjaan": "...", "Tanggal Negosiasi": "..."}',
+                "trigger": lambda nf: any(f in nf for f in ["Nomor Kontrak Kerja", "Nomor Kontrak Internal", "Daftar Nomor Kontrak", "Nama Pekerjaan", "Tanggal Negosiasi", "Dokumen Pendukung"]),
+                "intro": "Berikut cuplikan judul, nomor dokumen, pembuka (preamble), konsiderans surat pendukung, dan lampiran dari dokumen kontrak:",
+                "task": "Tugas: Ekstrak Nomor Kontrak Kerja, Nomor Kontrak Internal (jika ada nomor kedua), Daftar Nomor Kontrak (array), Nama Pekerjaan, Tanggal Negosiasi, dan Dokumen Pendukung (array of {Nama Dokumen, Nomor Dokumen, Tanggal Dokumen}).",
+                "template": '{"Nomor Kontrak Kerja": "...", "Nomor Kontrak Internal": "...", "Daftar Nomor Kontrak": ["..."], "Nama Pekerjaan": "...", "Tanggal Negosiasi": "...", "Dokumen Pendukung": [{"Nama Dokumen": "...", "Nomor Dokumen": "...", "Tanggal Dokumen": "..."}]}',
             },
             {
-                "trigger": lambda nf: any(f in nf for f in ["Lokasi", "Tanggal Pembuatan Dokumen"]),
-                "snippet": lambda lines: "\n".join(lines[-35:]),
-                "intro": "Berikut bagian akhir dokumen kontrak (tanda tangan & penutup):",
-                "task": "Tugas: Ekstrak Lokasi (kota pembuatan dokumen) dan Tanggal Pembuatan Dokumen (tanggal penandatanganan).",
-                "template": '{"Lokasi": "...", "Tanggal Pembuatan Dokumen": "..."}',
+                "trigger": lambda nf: any(f in nf for f in ["Lokasi", "Tanggal Pembuatan Dokumen", "Daftar Penandatangan", "Informasi Bea Meterai"]),
+                "intro": "Berikut bagian akhir dokumen kontrak (tanda tangan, meterai, & penutup):",
+                "task": "Tugas: Ekstrak Lokasi, Tanggal Pembuatan Dokumen, Daftar Penandatangan (array of {Nama, Jabatan}), dan Informasi Bea Meterai.",
+                "template": '{"Lokasi": "...", "Tanggal Pembuatan Dokumen": "...", "Daftar Penandatangan": [{"Nama": "...", "Jabatan": "..."}], "Informasi Bea Meterai": "..."}',
             },
         ]
-        return self._run_targeted_groups(markdown_text, null_fields, groups)
+        return self._run_targeted_groups(system_prompt, doc_text, null_fields, groups)
 
-    def _extract_targeted_sph_clauses(self, markdown_text: str, null_fields: List[str]) -> Dict[str, Any]:
+    def _extract_targeted_sph_clauses(self, system_prompt: str, doc_text: str,
+                                      null_fields: List[str]) -> Dict[str, Any]:
         groups = [
             {
                 "trigger": lambda nf: any(f in nf for f in ["Perihal / Nama Pekerjaan", "Nomor SPH", "Tanggal SPH"]),
-                "snippet": lambda lines: "\n".join(lines[:45]),
                 "intro": "Berikut pembuka dan header dari Surat Penawaran Harga (SPH):",
                 "task": "Ekstrak: Perihal / Nama Pekerjaan, Nomor SPH, Tanggal SPH.",
                 "template": '{"Perihal / Nama Pekerjaan": "...", "Nomor SPH": "...", "Tanggal SPH": "..."}',
             },
             {
                 "trigger": lambda nf: any(f.startswith("Vendor.") for f in nf),
-                "snippet": lambda lines: self._slice_lines(lines, ["pt.", "pt ", "cv.", "npwp", "telp", "email", "alamat", "hormat kami"], 2, 3, 20),
                 "intro": "Berikut cuplikan informasi vendor dari SPH:",
                 "task": "Ekstrak: Nama Vendor, Alamat Vendor, Kontak / Email, NPWP.",
                 "template": '{"Nama Vendor": "...", "Alamat Vendor": "...", "Kontak / Email": "...", "NPWP": "..."}',
@@ -288,13 +344,12 @@ class OllamaExtractor:
             },
             {
                 "trigger": lambda nf: any(f in nf for f in ["Garansi / SLA", "Syarat dan Ketentuan", "Masa Berlaku Penawaran", "Jangka Waktu Pengiriman"]),
-                "snippet": lambda lines: self._slice_lines(lines, ["garansi", "warranty", "sla", "syarat", "ketentuan", "berlaku", "delivery", "pengiriman"], 1, 3, 25),
                 "intro": "Berikut cuplikan syarat dan ketentuan dari SPH:",
                 "task": "Ekstrak: Garansi / SLA, Syarat dan Ketentuan (array), Masa Berlaku Penawaran, Jangka Waktu Pengiriman.",
                 "template": '{"Garansi / SLA": "...", "Syarat dan Ketentuan": ["..."], "Masa Berlaku Penawaran": "...", "Jangka Waktu Pengiriman": "..."}',
             },
         ]
-        return self._run_targeted_groups(markdown_text, null_fields, groups)
+        return self._run_targeted_groups(system_prompt, doc_text, null_fields, groups)
 
     # ------------------------------------------------------------------ context budget
     def _prepare_effective_text(self, enriched_text: str, max_chars: int = None) -> str:
@@ -332,14 +387,20 @@ class OllamaExtractor:
         system_prompt: str,
         schema_class: type,
         retry_template: str,
-        targeted: Callable[[str, List[str]], Dict[str, Any]],
+        targeted: Callable[[str, str, List[str]], Dict[str, Any]],
         targeted_min_chars: int,
     ) -> BaseModel:
         effective_text = self._prepare_effective_text(self.context_analyzer.enrich_markdown(markdown_text))
-        user_prompt = f"Berikut teks dokumen {doc_label} hasil parsing:\n\n{effective_text}\n\nEkstrak seluruh informasi sesuai schema JSON."
+        # Prefix bersama untuk SEMUA panggilan dokumen ini (lihat _doc_first_messages).
+        doc_text = f"Berikut teks dokumen {doc_label} hasil parsing:\n\n{effective_text}"
+        self._doc_text, self._system_prompt = doc_text, system_prompt
 
         logger.info(f"🤖 Extraction pass 1 [{self.model_name}] (num_ctx={config.OLLAMA_NUM_CTX})...")
-        extracted = self._extract_with_llm(system_prompt, user_prompt, schema_class)
+        extracted = self._extract_with_llm(
+            system_prompt, doc_text,
+            "Ekstrak seluruh informasi sesuai schema JSON.",
+            schema_class, drop_fields=DETERMINISTIC_FIELDS,
+        )
         data = extracted.model_dump(by_alias=True)
         total, nulls, null_names = self._count_null_fields(data)
         logger.info(f"📊 Pass 1: {total - nulls}/{total} field terisi")
@@ -359,18 +420,17 @@ class OllamaExtractor:
 
         if null_names and len(markdown_text) > targeted_min_chars:
             logger.info(f"🎯 Targeted clause refinement untuk {len(null_names)} field null...")
-            _apply(targeted(markdown_text, null_names), "targeted scan")
+            _apply(targeted(system_prompt, doc_text, null_names), "targeted scan")
 
         for attempt in range(config.MAX_EXTRACTION_RETRIES):
             if nulls / max(total, 1) <= config.NULL_FIELD_THRESHOLD:
                 break
             logger.info(f"🔄 Retry {attempt + 1} (null ratio {nulls / max(total, 1):.0%})...")
-            retry_prompt = retry_template.format(null_fields="\n".join(f"- {n}" for n in null_names), markdown_text=effective_text)
-            try:
-                _apply(self._extract_with_llm(system_prompt, retry_prompt, schema_class).model_dump(by_alias=True), f"retry {attempt + 1}")
-            except Exception as e:
-                logger.warning(f"⚠️  Retry {attempt + 1} gagal: {e}")
-                break
+            # Retry hanya meminta field yang masih kosong, bukan membangkitkan ulang seluruh
+            # schema. Sebelumnya satu retry mengetik ulang ~2.300 token (termasuk tabel) hanya
+            # untuk mengisi beberapa field.
+            retry_task = retry_template.format(null_fields="\n".join(f"- {n}" for n in null_names))
+            _apply(self._ask_json(system_prompt, doc_text, retry_task), f"retry {attempt + 1}")
 
         # Fallback deterministic dari context analyzer untuk field yang masih null
         hints = self.context_analyzer.get_entity_hints(markdown_text)
@@ -449,6 +509,82 @@ class OllamaExtractor:
                 return candidate
         return None
 
+    # ------------------------------------------------------------------ item fallback
+    def _fill_items_via_llm(self, item_model: type, alias: str, key_attrs: Tuple[str, ...]) -> List[BaseModel]:
+        """
+        Jaring pengaman: dipakai HANYA kalau parser tidak menemukan baris tabel sama sekali
+        (mis. daftar item ditulis sebagai paragraf, bukan tabel). Memakai prefix dokumen yang
+        sama dengan pass-1, jadi prefill-nya nyaris gratis.
+        """
+        if not self._doc_text:
+            return []
+        logger.info(f"📋 Tabel tidak terdeteksi parser → minta LLM menyusun '{alias}'...")
+        result = self._ask_json(
+            self._system_prompt, self._doc_text,
+            f"Kumpulkan seluruh baris barang/jasa/pekerjaan dari dokumen di atas.\n"
+            f"Keluarkan HANYA JSON: {{\"{alias}\": [{{...}}, ...]}} "
+            f"dengan tiap baris memuat minimal: {', '.join(key_attrs)}.\n"
+            f"Jika dokumen memang tidak memuat rincian item, keluarkan {{\"{alias}\": []}}.",
+        )
+        rows = result.get(alias) or []
+        if not isinstance(rows, list):
+            return []
+        items: List[BaseModel] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                items.append(item_model.model_validate(row))
+            except Exception as e:
+                logger.debug(f"Baris item dari LLM tidak valid, dilewati: {e}")
+        if items:
+            logger.info(f"📋 {len(items)} item disusun oleh LLM (fallback)")
+        return items
+
+    OPTIONAL_ITEM_ATTRS = ("spesifikasi", "brand_merek", "nomor_part", "periode", "keterangan")
+
+    def _enrich_item_columns(self, items: List[BaseModel], desc_attr: str) -> None:
+        """
+        Baris & angka sudah deterministik dari tabel parser. Kolom deskriptif (spesifikasi,
+        merek, part number) sering tersebar di paragraf lain, jadi kolom itu — dan HANYA kolom
+        itu — diisi LLM lewat satu panggilan kecil di atas prefix dokumen yang sudah ter-cache.
+        """
+        if not items or not self._doc_text:
+            return
+        attrs = [a for a in self.OPTIONAL_ITEM_ATTRS if hasattr(items[0], a)]
+        missing = [a for a in attrs if all(getattr(i, a, None) in (None, "") for i in items)]
+        if not missing:
+            return
+
+        listing = "\n".join(f"{n}. {(getattr(i, desc_attr) or '').strip()}" for n, i in enumerate(items, 1))
+        alias_of = {a: items[0].model_fields[a].alias or a for a in missing}
+        task = (
+            "Baris tabel di bawah ini sudah benar dan TIDAK boleh diubah. Tugasmu hanya melengkapi "
+            f"kolom {', '.join(alias_of.values())} untuk tiap baris, berdasarkan dokumen di atas.\n\n"
+            f"{listing}\n\n"
+            "Keluarkan HANYA JSON: {\"rows\": [{\"no\": 1, "
+            + ", ".join(f'"{v}": "..."' for v in alias_of.values())
+            + "}, ...]}\nKosongkan (null) kolom yang tidak disebutkan di dokumen. Jangan mengarang."
+        )
+        rows = (self._ask_json(self._system_prompt, self._doc_text, task) or {}).get("rows") or []
+        filled = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                idx = int(row.get("no", 0)) - 1
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= idx < len(items):
+                continue
+            for attr, alias in alias_of.items():
+                value = row.get(alias)
+                if not _is_empty(value) and getattr(items[idx], attr, None) in (None, ""):
+                    setattr(items[idx], attr, value)
+                    filled += 1
+        if filled:
+            logger.info(f"🧩 {filled} kolom opsional item dilengkapi LLM ({', '.join(alias_of.values())})")
+
     def _apply_hint_fallbacks(self, extracted: BaseModel, markdown_text: str, mapping: Dict[str, str]) -> None:
         hints = self.context_analyzer.get_entity_hints(markdown_text)
         for attr, hint_key in mapping.items():
@@ -468,7 +604,11 @@ class OllamaExtractor:
             ItemBarangPekerjaan, "deskripsi", "jumlah_harga", "Jumlah Harga",
             [extracted.sub_total, extracted.total_harga_pekerjaan],
         )
+        if not extracted.items:
+            extracted.items = self._fill_items_via_llm(
+                ItemBarangPekerjaan, "List Item/Barang", ("Deskripsi", "Volume", "Harga Satuan", "Jumlah Harga"))
         extracted.items = self._clean_and_number_items(extracted.items, "deskripsi", "nomor_item")
+        self._enrich_item_columns(extracted.items, "deskripsi")
 
         self._apply_hint_fallbacks(extracted, markdown_text, {
             "lokasi": "Lokasi", "tanggal_pembuatan_dokumen": "Tanggal Pembuatan Dokumen",
@@ -550,7 +690,11 @@ class OllamaExtractor:
             SPHItemDetail, "nama_item", "total_harga", "Total Harga",
             [extracted.subtotal, extracted.grand_total],
         )
+        if not extracted.items:
+            extracted.items = self._fill_items_via_llm(
+                SPHItemDetail, "Daftar Penawaran Harga", ("Nama Item", "Qty", "Harga Satuan", "Total Harga"))
         extracted.items = self._clean_and_number_items(extracted.items, "nama_item", "nomor")
+        self._enrich_item_columns(extracted.items, "nama_item")
         if not extracted.daftar_tabel_terstruktur:
             extracted.daftar_tabel_terstruktur = extract_tables_from_markdown(markdown_text) or None
         return extracted
@@ -569,6 +713,9 @@ class OllamaExtractor:
         extracted.items = self._reconcile_bast_items(
             extracted.items, extract_items_from_markdown_tables(markdown_text, doc_type="bast"),
         )
+        if not extracted.items:
+            extracted.items = self._fill_items_via_llm(
+                BASTItemDetail, "Daftar Barang/Pekerjaan Diserahkan", ("Deskripsi", "Volume", "Satuan"))
         extracted.items = self._clean_and_number_items(extracted.items, "deskripsi", "nomor")
         self._reconcile_parties(extracted, markdown_text)
         if not extracted.daftar_tabel_terstruktur:

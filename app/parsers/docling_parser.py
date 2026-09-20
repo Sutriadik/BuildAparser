@@ -16,6 +16,7 @@ dideteksi via app.parsers.block_grouper (lihat modul itu untuk detail & alasan).
 import time
 from typing import Dict, List, Optional
 
+from app.config import config
 from app.logger import logger
 from app.parsers.block_grouper import BARE_FORM_LABELS, DraftBlock, process_page_blocks
 from app.parsers.text_cleaner import clean_ocr_text
@@ -28,6 +29,7 @@ from app.schemas.common import (
     ParseMetadata,
     StructureItem,
     TextRange,
+    full_page_bbox,
 )
 
 NATIVE_CONFIDENCE = 0.97
@@ -72,6 +74,33 @@ def _classify_label(label: str, text_val: str) -> str:
     return mapped
 
 
+def _block_to_markdown(block_type: str, text: str) -> str:
+    """
+    Render satu blok sesuai tipenya yang sudah diklasifikasi (_classify_label).
+
+    Sebelumnya semua tipe selain heading/list_item/table jatuh ke teks polos, sehingga
+    `.parse.md` sama sekali tidak punya heading -- judul pasal, footer, dan isian formulir
+    tidak bisa dibedakan, baik oleh manusia maupun oleh LLM ekstraktor.
+    """
+    if block_type in ("heading", "section_header"):
+        return text if text.startswith("#") else f"## {text}"
+    if block_type == "list_item":
+        return text if text.startswith(("- ", "* ")) else f"- {text}"
+    if block_type == "key_value":
+        # Isian formulir: "Nama : Sutriadi Kurniawan" -> "- **Nama** : Sutriadi Kurniawan"
+        label, sep, value = text.partition(":")
+        if sep and label.strip() and len(label) < 80:
+            return f"- **{label.strip()}** : {value.strip()}"
+        return f"- {text}"
+    if block_type == "caption":
+        return f"_{text}_"
+    if block_type == "footer":
+        return f"<!-- FOOTER: {text} -->"
+    if block_type in ("logo", "image"):
+        return f"<!-- {block_type.upper()}: {text} -->" if text else f"<!-- {block_type.upper()} -->"
+    return text  # paragraph & table sudah dalam bentuk final
+
+
 class DoclingParser:
     def __init__(self) -> None:
         self._converters: Dict[bool, object] = {}
@@ -85,8 +114,25 @@ class DoclingParser:
             options = PdfPipelineOptions()
             options.do_ocr = do_ocr
             options.do_table_structure = True
+            # Tanpa ini Docling memakai default-nya sendiri dan tidak memanfaatkan seluruh core.
+            try:
+                from docling.datamodel.pipeline_options import AcceleratorDevice, AcceleratorOptions
+                options.accelerator_options = AcceleratorOptions(
+                    num_threads=config.PARSER_NUM_THREADS, device=AcceleratorDevice.AUTO,
+                )
+                logger.info(f"⚡ Docling accelerator: {config.PARSER_NUM_THREADS} thread, device=AUTO")
+            except Exception as e:
+                logger.info(f"ℹ️ AcceleratorOptions tidak tersedia, memakai default Docling: {e}")
             if do_ocr:
                 options.images_scale = 2.0  # Tingkatkan DPI render citra untuk OCR agar teks halus/miring terbaca
+                try:
+                    import sys
+                    if sys.platform == "darwin":
+                        from docling.datamodel.pipeline_options import OcrMacOptions
+                        options.ocr_options = OcrMacOptions()
+                        logger.info("⚡ Docling OCR: Mengaktifkan Apple Vision Neural Engine (Akurasi Tinggi & Cepat)")
+                except Exception as e:
+                    logger.info(f"ℹ️ Docling OCR fallback ke default engine: {e}")
             self._converters[do_ocr] = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
             )
@@ -187,16 +233,40 @@ class DoclingParser:
             )
 
         # 4. Gabung baris senada berdekatan, tandai blok attestation (tanda tangan), dan
-        #    urutkan ala urutan baca (bukan cuma ymin -- lihat reading_order_sort untuk
-        #    alasan layout dua kolom seperti blok tanda tangan PIHAK PERTAMA/KEDUA).
+        #    urutkan ala urutan baca per halaman.
         pages_structure = []
+        page_markdown_parts = []
+        full_markdown = ""
+
         for p_no in sorted(page_drafts):
             processed = process_page_blocks(page_drafts[p_no])
+            page_block_strings = []
+
+            for draft in processed:
+                if not draft.text or not draft.text.strip():
+                    continue
+                text_str = draft.text.strip()
+                block_md = _block_to_markdown(draft.type, text_str)
+                page_block_strings.append((draft, block_md))
+
+            page_md = "\n\n".join(md for _, md in page_block_strings)
+            page_start_offset = len(full_markdown) + (len("\n\n<!-- PAGE BREAK -->\n\n") if full_markdown else 0)
+
+            curr_offset = page_start_offset
+            for draft, block_md in page_block_strings:
+                draft.start = curr_offset
+                draft.end = curr_offset + len(block_md)
+                curr_offset += len(block_md) + 2
+
+            if full_markdown:
+                full_markdown += "\n\n<!-- PAGE BREAK -->\n\n" + page_md
+            else:
+                full_markdown = page_md
 
             children: List[StructureItem] = []
             for idx, draft in enumerate(processed):
                 box = (BoundingBox(xmin=draft.bbox[0], ymin=draft.bbox[1], xmax=draft.bbox[2], ymax=draft.bbox[3])
-                       if draft.bbox else BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0))
+                       if draft.bbox else full_page_bbox())
                 grounding = Grounding(page=p_no, range=TextRange(start=draft.start or 0, end=draft.end or 0),
                                       box=box, confidence=draft.confidence)
                 atomic = []
@@ -212,10 +282,12 @@ class DoclingParser:
 
             pages_structure.append(StructureItem(
                 type="page", id=f"page-{p_no}",
-                grounding=Grounding(page=p_no, range=TextRange(start=0, end=len(markdown_text)),
-                                    box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0), confidence=1.0),
+                grounding=Grounding(page=p_no, range=TextRange(start=page_start_offset, end=page_start_offset + len(page_md)),
+                                    box=full_page_bbox(), confidence=1.0),
                 children=children, confidence=1.0,
             ))
+
+        markdown_text = clean_ocr_text(full_markdown) if full_markdown else clean_ocr_text(doc.export_to_markdown())
 
         duration_ms = int((time.time() - start_time) * 1000)
         engine_name = "ibm-docling" + ("+ocr" if do_ocr else "")
