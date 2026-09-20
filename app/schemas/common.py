@@ -10,6 +10,11 @@ class BoundingBox(BaseModel):
     xmax: float
     ymax: float
 
+
+def full_page_bbox() -> BoundingBox:
+    """Bbox fallback saat elemen tidak punya koordinat spesifik (mencakup seluruh halaman)."""
+    return BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0)
+
 class TextRange(BaseModel):
     start: int
     end: int

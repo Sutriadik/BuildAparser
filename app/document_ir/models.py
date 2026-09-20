@@ -17,6 +17,13 @@ CANONICAL_BLOCK_TYPES = {
 }
 
 
+def union_bbox(boxes: List[BBox]) -> Optional[BBox]:
+    """Bounding box gabungan (xmin/ymin minimum, xmax/ymax maksimum) dari sekumpulan box."""
+    if not boxes:
+        return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
 class DocumentBlock(BaseModel):
     document_id: str
     block_id: str

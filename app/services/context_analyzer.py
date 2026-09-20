@@ -159,17 +159,24 @@ class ContextAnalyzer:
 
         # --- Nomor Kontrak / SPK / Dokumen
         contract_patterns = [
-            r'(?:Nomor\s+Kontrak(?:\s+Kerja)?|Nomor\s+SPK|No\.?\s*SPK|Nomor\s+PKS|No\.?\s*PKS)\s*:?\s*([A-Za-z0-9\.\-\/_]+)',
-            r'(?:^|\n)\s*(?:##\s*)?(?:SURAT\s+PERINTAH\s+KERJA|KONTRAK\s+LAYANAN|PERJANJIAN\s+KERJA\s+SAMA)[\s\S]{0,120}?(?:Nomor|No\.?)\s*:?\s*([A-Za-z0-9\.\-\/_]+(?:[ \t]*\/[ \t]*[A-Za-z0-9\.\-\/_]+)*)',
-            r'(?:^|\n)\s*Nomor\s*:?\s*([A-Za-z0-9\.\-\/_]{5,})',
+            r'(?:Nomor\s+Kontrak(?:\s+Kerja)?|Nomor\s+SPK|No\.?\s*SPK|Nomor\s+PKS|No\.?\s*PKS)\s*:?\s*([A-Za-z0-9.\-_/]{4,}(?:[ \t]*/[ \t]*[A-Za-z0-9.\-_/]+)*)',
+            r'(?:^|\n)\s*(?:##\s*)?(?:SURAT\s+PERINTAH\s+KERJA|KONTRAK\s+LAYANAN|PERJANJIAN\s+KERJA\s+SAMA)[\s\S]{0,160}?(?:Nomor|No\.?)\s*:?\s*([A-Za-z0-9.\-_/]{4,}(?:[ \t]*/[ \t]*[A-Za-z0-9.\-_/]+)*)',
+            r'(?:^|\n)\s*(?:##\s*)?Nomor\s*:?\s*([A-Za-z0-9.\-_/]{5,}(?:[ \t]*/[ \t]*[A-Za-z0-9.\-_/]+)*)',
         ]
+        all_contract_nos = []
         for cp in contract_patterns:
-            m_cp = re.search(cp, text, re.IGNORECASE)
-            if m_cp:
+            for m_cp in re.finditer(cp, text, re.IGNORECASE):
                 val = m_cp.group(1).strip()
-                if len(val) >= 4 and not val.lower().startswith(('rekening', 'telepon', 'npwp', 'akta')):
-                    put(self._entity(text, 'Nomor Kontrak Kerja', val, m_cp.start(), 0.85))
-                    break
+                val = re.sub(r'\s+', '', val)
+                # Valid contract numbers must contain at least one digit and not be reserved noise words
+                if any(c.isdigit() for c in val) and len(val) >= 5 and not val.lower().startswith(('rekening', 'telepon', 'npwp', 'akta', 'pasal')):
+                    if val not in all_contract_nos:
+                        all_contract_nos.append(val)
+
+        if all_contract_nos:
+            put(self._entity(text, 'Nomor Kontrak Kerja', all_contract_nos[0], 0, 0.95))
+            if len(all_contract_nos) > 1:
+                put(self._entity(text, 'Nomor Kontrak Internal', all_contract_nos[1], 0, 0.90))
 
         # --- Tanggal Negosiasi: mencari konsiderans negosiasi/kesepakatan harga
         m_neg = re.search(
@@ -202,7 +209,7 @@ class ContextAnalyzer:
                     break
 
         # "Dibuat di : Bandung" — nama kota berhuruf kapital, satu baris ("dibuat di hadapan Notaris" tidak ikut).
-        closings = list(re.finditer(r'(?i:dibuat\s+di)[ \t]*:?[ \t]*(?:\n\s*:?[ \t]*)?([A-Z][A-Za-z]+(?:[ \t]+[A-Z][a-z]+)?)\b', text))
+        closings = list(re.finditer(r'(?i:dibuat\s+di|bertempat\s+di)[ \t]*:?[ \t]*(?:\n\s*:?[ \t]*)?([A-Z][A-Za-z]+(?:[ \t]+[A-Z][a-z]+)?)\b', text))
         if closings:
             last = closings[-1]
             put(self._entity(text, 'Lokasi', last.group(1), last.start(), 0.85))
@@ -214,10 +221,10 @@ class ContextAnalyzer:
         m = re.search(r'(?:jangka\s+waktu|akses)\s+selama\s+(\d{1,2}\s+\w+\s+\d{4}\s*[-–s/d]+\s*\d{1,2}\s+\w+\s+\d{4})', text, re.IGNORECASE)
         if m:
             put(self._entity(text, 'Jangka Waktu', m.group(1), m.start()))
-        m = re.search(r'(?:lama\s+pekerjaan|durasi|jangka\s+waktu\s+pelaksanaan)\s+(?:selama\s+)?(\d+\s*\(?[a-z\s]*\)?\s*hari\s+kalender)', text, re.IGNORECASE)
+        m = re.search(r'(?:lama\s+pekerjaan|durasi|jangka\s+waktu\s+pelaksanaan)\s+(?:selama\s+)?(\d+\s*\(?[a-z\s]*\)?\s*hari\s+kalender|\d+\s*\(?[a-z\s]*\)?\s*bulan)', text, re.IGNORECASE)
         if m:
             put(self._entity(text, 'Durasi Kerja', m.group(1), m.start()))
-        m = re.search(r'(?:denda|sanksi)\s+(?:keterlambatan\s+)?sebesar\s+(\d+\s*/\s*\d+\s*(?:\([^)]{1,30}\))?|\d+(?:[.,]\d+)?\s*%)', text, re.IGNORECASE)
+        m = re.search(r'(?:denda|sanksi)\s+(?:keterlambatan\s+)?sebesar\s+(\d+\s*/\s*\d+\s*(?:\([^)]{1,30}\))?|\d+(?:[.,]\d+)?\s*‰|\d+(?:[.,]\d+)?\s*%)', text, re.IGNORECASE)
         if m:
             put(self._entity(text, 'Persentase Sanksi/Penalti', m.group(1), m.start()))
 
@@ -259,6 +266,10 @@ class ContextAnalyzer:
         comp = re.search(r'mewakili\s+(?:secara\s+)?(?:sah\s*)?:?\s*([^,\n]+?)(?:\s*,|\s*$|\s+selanjutnya)', block, re.IGNORECASE)
         if comp:
             info['nama_perusahaan'] = comp.group(1).strip(' :')
+
+        npwp_m = re.search(r'NPWP\s*:?\s*([\d.\-]+)', block, re.IGNORECASE)
+        if npwp_m:
+            info['npwp'] = npwp_m.group(1).strip()
 
         lines = [l.strip() for l in block.split('\n') if l.strip()]
         label_map = {'nama': 'nama_representative', 'jabatan': 'jabatan', 'alamat': 'alamat'}
@@ -302,6 +313,11 @@ class ContextAnalyzer:
             c_m = re.search(r'((?:PERUSAHAAN\s+PERSEROAN\s+\(PERSERO\)\s+)?PT\.?\s+[A-Za-z0-9\s.]+?)(?:,|\s+NPWP)', block_text)
             if c_m:
                 info['nama_perusahaan'] = c_m.group(1).strip()
+
+        npwp_m = re.search(r'NPWP\s*:?\s*([\d.\-]+)', block_text, re.IGNORECASE)
+        if npwp_m:
+            info['npwp'] = npwp_m.group(1).strip()
+
         rep_m = re.search(r'diwakili\s+(?:secara\s+)?sah\s+oleh\s+([A-Za-z\s.,]+?),\s*Jabatan\s+([A-Za-z0-9\s.,&/\-]+?)(?:,|\s+selanjutnya|\.|$)', block_text, re.IGNORECASE)
         if rep_m:
             info['nama_representative'] = rep_m.group(1).strip()

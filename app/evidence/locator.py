@@ -10,7 +10,7 @@ kontrak dan harga tetap wajib dikunci PM per field sebelum dipakai.
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from app.document_ir.models import BBox, DocumentBlock, DocumentIR
+from app.document_ir.models import BBox, DocumentIR, union_bbox
 from app.evidence.matcher import calculate_match_confidence, canon, is_numeric_query
 from app.extractors.deterministic.numbers import format_number_for_matching
 from app.schemas.common import BoundingBox
@@ -45,13 +45,6 @@ def _to_bounding_box(b: Optional[BBox]) -> Optional[BoundingBox]:
     x1, x2 = (round(max(0.0, min(1.0, float(v))), 5) for v in (b[0], b[2]))
     y1, y2 = (round(max(0.0, min(1.0, float(v))), 5) for v in (b[1], b[3]))
     return BoundingBox(xmin=min(x1, x2), ymin=min(y1, y2), xmax=max(x1, x2), ymax=max(y1, y2))
-
-
-def _union_bbox(blocks: List[DocumentBlock]) -> Optional[BBox]:
-    boxes = [b.bbox for b in blocks if b.bbox]
-    if not boxes:
-        return None
-    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
 def _is_better(candidate: EvidenceMatch, best: Optional[EvidenceMatch]) -> bool:
@@ -96,7 +89,7 @@ def locate_value(value: Any, ir: DocumentIR, min_score: float = MIN_SCORE_DEFAUL
                     score, match_type = calculate_match_confidence(query, joined, ocr_confidence=conf)
                     if score >= min_score and match_type:
                         candidate = EvidenceMatch(round(score - MULTI_BLOCK_PENALTY, 3), f"{match_type}+multiblock", page.page_number,
-                                                  _union_bbox(window), joined, [b.block_id for b in window], conf)
+                                                  union_bbox([b.bbox for b in window if b.bbox]), joined, [b.block_id for b in window], conf)
                         if _is_better(candidate, best):
                             best = candidate
     return best

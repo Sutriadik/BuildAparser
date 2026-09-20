@@ -26,7 +26,8 @@ from app.schemas.common import (
     Grounding,
     BoundingBox,
     TextRange,
-    AtomicGrounding
+    AtomicGrounding,
+    full_page_bbox,
 )
 
 
@@ -287,7 +288,7 @@ class PaddleOCRParser:
                     grounding=Grounding(
                         page=page_num,
                         range=TextRange(start=0, end=len(page_md)),
-                        box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0),
+                        box=full_page_bbox(),
                         confidence=1.0
                     ),
                     children=page_items,
@@ -431,7 +432,7 @@ class PaddleOCRParser:
                     type="page", id=f"page-{page_num}",
                     grounding=Grounding(
                         page=page_num, range=TextRange(start=0, end=len(page_md)),
-                        box=BoundingBox(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0),
+                        box=full_page_bbox(),
                         confidence=1.0
                     ),
                     children=page_items, confidence=1.0

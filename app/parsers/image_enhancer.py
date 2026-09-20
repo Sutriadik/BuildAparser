@@ -8,9 +8,7 @@ Modul preprocessing citra dokumen scanned & image-based PDF:
 5. High-Resolution 300 DPI Rendering
 """
 import math
-import tempfile
-from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, Union
+from typing import Dict, Any, Optional, Union
 
 import cv2
 import numpy as np
@@ -258,47 +256,3 @@ def render_pdf_page_high_res(page: fitz.Page, target_dpi: int = 300) -> np.ndarr
         img_bgr = img_data
         
     return img_bgr
-
-
-def enhance_scanned_pdf(
-    pdf_path: str, 
-    output_pdf_path: Optional[str] = None, 
-    target_dpi: int = 300
-) -> str:
-    """
-    Membuat versi PDF pindaian beresolusi tinggi (300 DPI) yang telah ditingkatkan
-    kontras, ketajaman, dan kelurusan halamannya untuk diproses oleh OCR.
-    
-    Returns:
-        Path ke file PDF yang telah ditingkatkan kualitasnya.
-    """
-    doc = fitz.open(pdf_path)
-    if output_pdf_path is None:
-        temp_dir = tempfile.gettempdir()
-        stem = Path(pdf_path).stem
-        output_pdf_path = str(Path(temp_dir) / f"{stem}_enhanced_300dpi.pdf")
-        
-    enhanced_doc = fitz.open()
-    
-    logger.info(f"✨ Menerapkan Quality Enhancement Layer pada {len(doc)} halaman scanned PDF ({target_dpi} DPI)...")
-    
-    for page_idx in range(len(doc)):
-        page = doc[page_idx]
-        high_res_img = render_pdf_page_high_res(page, target_dpi=target_dpi)
-        processed_img = preprocess_image_for_ocr(high_res_img)
-        
-        # Simpan citra terproses ke buffer JPEG kualitas tinggi
-        _, img_encoded = cv2.imencode('.jpg', processed_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        img_bytes = img_encoded.tobytes()
-        
-        # Buat halaman baru dengan dimensi asli
-        rect = page.rect
-        new_page = enhanced_doc.new_page(width=rect.width, height=rect.height)
-        new_page.insert_image(rect, stream=img_bytes)
-        
-    enhanced_doc.save(output_pdf_path)
-    enhanced_doc.close()
-    doc.close()
-    
-    logger.info(f"✅ PDF Enhancement selesai: {output_pdf_path}")
-    return output_pdf_path
