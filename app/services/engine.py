@@ -19,6 +19,7 @@ from app.config import config
 from app.document_ir.adapter import from_parsed_response
 from app.document_ir.models import DocumentIR
 from app.evidence.locator import build_field_evidence
+from app.exporters.nocodb import build_nocodb_payload
 from app.extractors.prompts import PROMPT_VERSION
 from app.ingestion.profiler import DocumentProfile, profile_document
 from app.logger import logger
@@ -227,6 +228,7 @@ class OpenADEEngine:
 
         parsing_dir = Path(output_dir) / "parsing" if output_dir else config.PARSING_OUTPUT_DIR
         extraction_dir = Path(output_dir) / "extraction" if output_dir else config.EXTRACTION_OUTPUT_DIR
+        nocodb_dir = Path(output_dir) / "nocodb" if output_dir else config.NOCODB_OUTPUT_DIR
         parsing_dir.mkdir(parents=True, exist_ok=True)
         extraction_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,8 +298,17 @@ class OpenADEEngine:
         extract_json_file = extraction_dir / f"{path.stem}.extract.json"
         extract_json_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
+        # Payload datar siap POST ke NocoDB (lihat app/exporters/nocodb.py). Ditulis sebagai
+        # file terpisah supaya n8n cukup membaca satu file, tanpa perlu meratakan JSON nested.
+        nocodb_payload = build_nocodb_payload(payload)
+        nocodb_dir.mkdir(parents=True, exist_ok=True)
+        nocodb_json_file = nocodb_dir / f"{path.stem}.nocodb.json"
+        nocodb_json_file.write_text(json.dumps(nocodb_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        nocodb_rows = sum(len(r) for r in nocodb_payload.values())
+
         logger.info(f"\n🎉 Pipeline selesai dalam {timings['total_s']}s ({run_info['llm_calls']} LLM call)\n"
-                    f"  📁 {parse_md_file}\n  📁 {parse_json_file}\n  📁 {extract_json_file}")
+                    f"  📁 {parse_md_file}\n  📁 {parse_json_file}\n  📁 {extract_json_file}\n"
+                    f"  📁 {nocodb_json_file} ({nocodb_rows} baris / {len(nocodb_payload)} tabel)")
         return {
             "parsed": parsed,
             "ir": ir,
@@ -307,5 +318,6 @@ class OpenADEEngine:
             "evidence": evidence,
             "quality_report": quality_report,
             "run_info": run_info,
-            "files": {"markdown": str(parse_md_file), "parse_json": str(parse_json_file), "extract_json": str(extract_json_file)},
+            "files": {"markdown": str(parse_md_file), "parse_json": str(parse_json_file),
+                      "extract_json": str(extract_json_file), "nocodb_json": str(nocodb_json_file)},
         }

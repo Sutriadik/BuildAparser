@@ -21,7 +21,11 @@ class AppConfig(BaseModel):
     TEMP_UPLOADS: Path = STORAGE_DIR / "temp_uploads"
     OUTPUT_DIR: Path = STORAGE_DIR / "outputs"
     PARSING_OUTPUT_DIR: Path = OUTPUT_DIR / "parsing"
+    # .extract.json — hasil ekstraksi lengkap: nilai field + evidence + bounding box.
     EXTRACTION_OUTPUT_DIR: Path = OUTPUT_DIR / "extraction"
+    # .nocodb.json — baris datar siap POST ke NocoDB. Dipisah dari extraction/ karena
+    # isinya turunan (tanpa bbox) dan yang membacanya n8n, bukan manusia.
+    NOCODB_OUTPUT_DIR: Path = OUTPUT_DIR / "nocodb"
 
     # Ollama settings
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -37,7 +41,11 @@ class AppConfig(BaseModel):
     ENABLE_LLM_MARKDOWN_REFINER: bool = _env_bool("ENABLE_LLM_MARKDOWN_REFINER", True)
 
     # Parser settings
-    DEFAULT_PARSER: str = os.getenv("DEFAULT_PARSER", "paddle")
+    # docling (Apple Vision OCR di macOS) ~17 detik untuk 9 halaman scan; jalur paddle
+    # merender DAN meng-OCR tiap halaman dua kali (PaddleOCR lalu PP-Structure), jadi
+    # dipakai hanya sebagai fallback.
+    DEFAULT_PARSER: str = os.getenv("DEFAULT_PARSER", "docling")
+    PARSER_NUM_THREADS: int = _env_int("PARSER_NUM_THREADS", max(1, (os.cpu_count() or 4) - 2))
     DEFAULT_DPI: int = 150
     OCR_LANG: str = os.getenv("OCR_LANG", "en")
     SCANNED_CHAR_THRESHOLD: int = 40          # rata-rata karakter/halaman di bawah ini = scan
@@ -79,3 +87,4 @@ config = AppConfig()
 config.TEMP_UPLOADS.mkdir(parents=True, exist_ok=True)
 config.PARSING_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 config.EXTRACTION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+config.NOCODB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
