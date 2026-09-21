@@ -220,10 +220,16 @@ def preprocess_image_for_ocr(
 
     # 1. Deskew
     if auto_deskew:
-        quality = assess_image_quality(img_bgr)
-        if quality["needs_deskew"]:
-            logger.info(f"📐 Melakukan auto-deskew citra: {quality['skew_angle']}°")
-            img_bgr = deskew_image(img_bgr, angle=quality["skew_angle"])
+        # Panggil estimate_skew_angle LANGSUNG, bukan assess_image_quality: yang terakhir
+        # juga menghitung Laplacian variance, mean, dan std seluruh halaman (sharpness,
+        # brightness, contrast) yang TIDAK dipakai di sini -- murni kerja terbuang pada
+        # setiap halaman. assess_image_quality tetap ada untuk pemanggil yang butuh
+        # laporan kualitas lengkap.
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        skew_angle = estimate_skew_angle(gray)
+        if abs(skew_angle) > 0.5:
+            logger.info(f"📐 Melakukan auto-deskew citra: {round(skew_angle, 2)}°")
+            img_bgr = deskew_image(img_bgr, angle=skew_angle)
 
     # 2. Shadow removal & Contrast enhancement
     if auto_contrast:
@@ -237,14 +243,18 @@ def preprocess_image_for_ocr(
 
 
 def render_pdf_page_high_res(page: fitz.Page, target_dpi: int = 300) -> np.ndarray:
-    """
-    Merender halaman PDF ke citra resolusi tinggi (default: 300 DPI).
-    Standar 72 DPI PDF diskalakan dengan zoom matrix = 300 / 72 (~4.16x).
-    """
+    """Merender halaman PDF ke citra BGR pada DPI tertentu (standar PDF = 72 DPI)."""
     zoom = target_dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    
+    return pixmap_to_bgr(page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False))
+
+
+def pixmap_to_bgr(pix) -> np.ndarray:
+    """
+    Pixmap PyMuPDF -> array BGR OpenCV, TANPA merender ulang halaman.
+
+    Dipisah dari render_pdf_page_high_res supaya pemanggil yang sudah punya pixmap
+    (mis. untuk diambil PNG-nya) tidak perlu merender halaman yang sama dua kali.
+    """
     img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n == 3:
         img_bgr = cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR)

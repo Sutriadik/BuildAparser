@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from app.config import config
 from app.logger import logger
 from app.parsers.text_cleaner import clean_ocr_text, clean_ocr_line
-from app.parsers.image_enhancer import render_pdf_page_high_res, preprocess_image_for_ocr
+from app.parsers.image_enhancer import pixmap_to_bgr, preprocess_image_for_ocr, render_pdf_page_high_res
 from app.schemas.common import (
     LandingAIParsedResponse,
     ParseMetadata,
@@ -207,14 +207,17 @@ class PaddleOCRParser:
             page = doc[page_idx]
             page_num = page_idx + 1
             
+            # SATU render per halaman, dipakai untuk dua kebutuhan sekaligus: PNG untuk
+            # PP-Structure dan array BGR untuk OCR. Dulu halaman yang sama dirender DUA KALI
+            # pada DPI yang sama (get_pixmap + render_pdf_page_high_res) -- murni kerja ganda,
+            # hasilnya byte-identical.
             pix = page.get_pixmap(dpi=config.DEFAULT_DPI)
             img_bytes = pix.tobytes("png")
             img_w = pix.width
             img_h = pix.height
-            
+
             # Extract raw OCR boxes for complete 100% page coverage
-            high_res_bgr = render_pdf_page_high_res(page, target_dpi=config.DEFAULT_DPI)
-            enhanced_bgr = preprocess_image_for_ocr(high_res_bgr)
+            enhanced_bgr = preprocess_image_for_ocr(pixmap_to_bgr(pix))
             ocr_results = self.get_engine().ocr(enhanced_bgr, cls=True)
             raw_boxes: List[OCRBox] = []
             if ocr_results and ocr_results[0]:
