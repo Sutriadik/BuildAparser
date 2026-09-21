@@ -19,9 +19,11 @@ from pathlib import Path
 # WAJIB dijalankan sebelum `app.*` di-import: AppConfig membaca environment
 # satu kali saat modul di-import.
 SETUP = {
-    "DEFAULT_PARSER": "docling",      # docling | paddle | auto
-    "OCR_ENGINE": "auto",             # auto | mac | easyocr | tesseract | rapidocr
-                                      # di server Linux, isi eksplisit (mis. "easyocr")
+    # SATU tombol pemilihan mesin OCR. Default rapidocr supaya hasil di laptop sama dengan
+    # hasil di server Linux/Windows -- Apple Vision ("mac") lebih cepat tapi hanya ada di
+    # macOS, jadi tidak layak jadi patokan pengukuran.
+    "OCR_ENGINE": "rapidocr",         # rapidocr | mac | tesseract | easyocr | paddle | auto
+    "DEFAULT_PARSER": "docling",      # dipertahankan untuk pemanggil lama; OCR_ENGINE menang
     "OLLAMA_MODEL": "qwen2.5:7b",
     "OLLAMA_NUM_CTX": "16384",        # samakan di seluruh pipeline, jangan diubah per tahap
     "OLLAMA_KEEP_ALIVE": "30m",       # model tetap di memori antar panggilan
@@ -47,7 +49,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"\n🚀 {path.name}")
-    print(f"   parser={os.environ['DEFAULT_PARSER']}  model={os.environ['OLLAMA_MODEL']}  "
+    print(f"   ocr={os.environ['OCR_ENGINE']}  model={os.environ['OLLAMA_MODEL']}  "
           f"num_ctx={os.environ['OLLAMA_NUM_CTX']}\n")
 
     started = time.time()

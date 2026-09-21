@@ -46,11 +46,14 @@ class AppConfig(BaseModel):
     # dipakai hanya sebagai fallback.
     DEFAULT_PARSER: str = os.getenv("DEFAULT_PARSER", "docling")
     PARSER_NUM_THREADS: int = _env_int("PARSER_NUM_THREADS", max(1, (os.cpu_count() or 4) - 2))
-    # auto | mac | easyocr | tesseract | rapidocr. "auto" memilih Apple Vision di macOS dan
-    # engine default Docling di platform lain (dengan peringatan). Di produksi Linux, SET
-    # NILAI EKSPLISIT -- nilai eksplisit gagal terang-terangan kalau engine tidak tersedia,
-    # sehingga hasil server tidak pernah diam-diam berbeda dari hasil laptop.
-    OCR_ENGINE: str = os.getenv("OCR_ENGINE", "auto")
+    # SATU tombol pemilihan mesin OCR: rapidocr | mac | tesseract | easyocr | paddle | auto
+    # Bisa juga dioper sebagai argumen Python: engine.parse(pdf, ocr="tesseract").
+    #
+    # Default rapidocr (BUKAN mac/auto) supaya hasil di laptop pengembang sama dengan hasil
+    # di server produksi Linux/Windows. Apple Vision lebih cepat & sedikit lebih akurat, tapi
+    # hanya ada di macOS -- kalau dijadikan default, setiap angka akurasi yang kita ukur di
+    # laptop jadi janji yang tidak bisa ditepati produksi.
+    OCR_ENGINE: str = os.getenv("OCR_ENGINE", "rapidocr")
     DEFAULT_DPI: int = 150
     OCR_LANG: str = os.getenv("OCR_LANG", "en")
     SCANNED_CHAR_THRESHOLD: int = 40          # rata-rata karakter/halaman di bawah ini = scan
@@ -72,14 +75,31 @@ class AppConfig(BaseModel):
 
     # PP-Structure Layout Analysis settings
     ENABLE_LAYOUT_ANALYSIS: bool = True   # Gunakan PPStructure untuk scanned docs (fallback engine)
-    LAYOUT_SCORE_THRESHOLD: float = 0.5  # Minimum confidence untuk layout region
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-    # NocoDB settings (Optional production integration)
+    # NocoDB settings (integrasi opsional; push mati secara default)
     NOCODB_URL: str = os.getenv("NOCODB_URL", "http://localhost:8080")
     NOCODB_API_TOKEN: str = os.getenv("NOCODB_API_TOKEN", "")
+    # NocoDB v2 memakai tableId acak (mis. "m1a2b3c4d5"), bukan nama tabel, jadi pemetaan
+    # harus diberikan eksplisit -- tidak bisa ditebak dari nama. Format env:
+    #   NOCODB_TABLE_IDS="contracts:m1abc,contract_items:m2def,field_confirmations:m3ghi"
+    NOCODB_TABLE_IDS: str = os.getenv("NOCODB_TABLE_IDS", "")
+    # Push langsung ke NocoDB dari FastAPI. Default mati: pada arsitektur briefing (hlm. 8)
+    # n8n yang mengorkestrasi, FastAPI cukup mengembalikan payload-nya.
+    NOCODB_PUSH_ENABLED: bool = _env_bool("NOCODB_PUSH_ENABLED", False)
+
+    def nocodb_table_ids(self) -> dict:
+        """Parse NOCODB_TABLE_IDS jadi {nama_tabel: tableId}."""
+        mapping = {}
+        for pair in self.NOCODB_TABLE_IDS.split(","):
+            if ":" in pair:
+                name, _, table_id = pair.partition(":")
+                name, table_id = name.strip(), table_id.strip()
+                if name and table_id:
+                    mapping[name] = table_id
+        return mapping
 
     # Versioning (Plan §27) — naikkan saat parser/schema berubah
     PARSER_VERSION: str = "parse-2026.09.1"

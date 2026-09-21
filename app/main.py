@@ -14,6 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import config
+from app.exporters.nocodb import build_nocodb_payload
 from app.services.engine import OpenADEEngine
 
 tags_metadata = [
@@ -148,9 +149,17 @@ def get_system_info():
             "temperature": config.OLLAMA_TEMPERATURE,
         },
         "parser_config": {
+            "ocr_engine_default": config.OCR_ENGINE,
+            "ocr_engine_choices": ["rapidocr", "mac", "tesseract", "easyocr", "paddle", "auto"],
             "ocr_lang": config.OCR_LANG,
             "default_dpi": config.DEFAULT_DPI,
             "scanned_char_threshold": config.SCANNED_CHAR_THRESHOLD,
+        },
+        "nocodb": {
+            "url": config.NOCODB_URL,
+            "push_enabled": config.NOCODB_PUSH_ENABLED,
+            "token_configured": bool(config.NOCODB_API_TOKEN),
+            "tables_mapped": sorted(config.nocodb_table_ids()),
         },
     }
 
@@ -164,12 +173,12 @@ def get_system_info():
 def parse_document_endpoint(
     file: UploadFile = File(..., description="File PDF/DOCX/Gambar dokumen yang ingin diproses"),
     max_pages: int = Form(None, description="Batas maksimal halaman (opsional)"),
-    parser: str = Form("paddle", description="Pilihan engine: 'paddle', 'docling', atau 'auto'"),
+    ocr: str = Form(None, description="Mesin OCR: 'rapidocr' (default), 'mac', 'tesseract', 'easyocr', atau 'paddle'"),
 ):
     temp_path = _save_upload(file)
     try:
         with _engine_lock:
-            return engine.parse(str(temp_path), max_pages=max_pages, parser=parser).model_dump()
+            return engine.parse(str(temp_path), max_pages=max_pages, ocr=ocr).model_dump()
     except HTTPException:
         raise
     except Exception as e:
@@ -206,12 +215,40 @@ def process_full_endpoint(
     file: UploadFile = File(..., description="File PDF/DOCX/Gambar yang ingin diproses"),
     doc_type: str = Form("auto", description="Tipe dokumen: 'auto', 'contract', 'sph', atau 'bast'"),
     max_pages: int = Form(None, description="Batas maksimal halaman (opsional)"),
-    parser: str = Form("paddle", description="Pilihan engine: 'paddle', 'docling', atau 'auto'"),
+    ocr: str = Form(None, description="Mesin OCR: 'rapidocr' (default), 'mac', 'tesseract', 'easyocr', atau 'paddle'"),
+    push_to_nocodb: bool = Form(False, description="Kirim hasil ke NocoDB. Default mati: pada arsitektur briefing, n8n yang mengorkestrasi push."),
 ):
     temp_path = _save_upload(file)
     try:
         with _engine_lock:
-            result = engine.process_full(str(temp_path), doc_type=doc_type, max_pages=max_pages, parser=parser)
+            result = engine.process_full(str(temp_path), doc_type=doc_type, max_pages=max_pages, ocr=ocr)
+        # Payload NocoDB SELALU disertakan di respons. Pada arsitektur briefing (hlm. 8)
+        # n8n yang mem-POST-nya ke NocoDB; push langsung di bawah hanya jalur alternatif.
+        nocodb_payload = build_nocodb_payload({
+            "document_name": Path(result["files"]["extract_json"]).stem.replace(".extract", ""),
+            "document_type": result["document_type"],
+            "data": result["extracted"].model_dump(by_alias=True),
+            "validation": result["validation"].model_dump(mode="json"),
+            "evidence": [e.model_dump(mode="json") for e in result["evidence"]],
+            "quality_report": result["quality_report"],
+            "run_info": result["run_info"],
+            "markdown": result["parsed"].markdown,
+        })
+
+        nocodb_push = None
+        if push_to_nocodb:
+            if not config.NOCODB_PUSH_ENABLED:
+                raise HTTPException(
+                    status_code=409,
+                    detail="push_to_nocodb diminta tapi NOCODB_PUSH_ENABLED=false. "
+                           "Aktifkan env NOCODB_PUSH_ENABLED=1 secara sadar sebelum menulis ke NocoDB.",
+                )
+            from app.services.nocodb_client import NocoDBClient, NocoDBError
+            try:
+                nocodb_push = NocoDBClient().push_payload(nocodb_payload)
+            except NocoDBError as e:
+                raise HTTPException(status_code=502, detail=str(e))
+
         return {
             "status": "success",
             "document_type": result["document_type"],
@@ -222,6 +259,8 @@ def process_full_endpoint(
             "run_info": result["run_info"],
             "metadata": result["parsed"].metadata.model_dump(),
             "files": result["files"],
+            "nocodb_payload": nocodb_payload,
+            "nocodb_push": nocodb_push,
         }
     except HTTPException:
         raise

@@ -341,6 +341,11 @@ def build_nocodb_payload(result: Dict[str, Any]) -> Dict[str, List[Dict[str, Any
             for i in (validation.get("issues") or []) if isinstance(i, dict)
         ) or None,
         "fill_rate": quality.get("fill_rate"),
+        # Markdown utuh hasil parsing, disimpan di kolom LongText NocoDB. Gunanya: saat PM
+        # mengonfirmasi field satu per satu (briefing hlm. 11), ia bisa membaca dokumennya
+        # langsung di NocoDB tanpa membuka PDF aslinya -- struktur heading/tabel tetap
+        # terbaca karena NocoDB merender teks panjang apa adanya.
+        "markdown_dokumen": result.get("markdown") or None,
         # Satu dokumen belum tentu selesai dikonfirmasi; flag ini baru True kalau SELURUH
         # baris field_confirmations sudah pm_confirmed. n8n yang menghitungnya.
         "semua_field_terkonfirmasi": False,
@@ -411,6 +416,7 @@ _FORCE_TEXT = {
     "durasi_kerja": "SingleLineText", "persentase_penalti": "SingleLineText",
     "nomor": "SingleLineText", "nomor_item": "SingleLineText",
     "jumlah_terbilang": "LongText", "hasil_uji_keseluruhan": "LongText",
+    "markdown_dokumen": "LongText",
 }
 
 

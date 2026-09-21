@@ -5,7 +5,7 @@ Satu format internal untuk semua perception engine. Layer extraction, evidence,
 dan validation hanya membaca DocumentIR, tidak lagi bergantung pada format
 output masing-masing parser.
 """
-from typing import Iterator, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -53,10 +53,6 @@ class DocumentIR(BaseModel):
     is_scanned: bool = False
     markdown: str = ""
     pages: List[DocumentPage] = Field(default_factory=list)
-
-    def iter_blocks(self) -> Iterator[DocumentBlock]:
-        for page in self.pages:
-            yield from page.blocks
 
     @property
     def block_count(self) -> int:

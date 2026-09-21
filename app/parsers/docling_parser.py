@@ -112,22 +112,28 @@ _OCR_ENGINES = {
 }
 
 
-def _resolve_ocr_engine() -> _OcrEngine:
+def _resolve_ocr_engine(requested: Optional[str] = None) -> _OcrEngine:
     """
     Tentukan engine OCR secara EKSPLISIT, dan katakan dengan keras yang mana.
+
+    `requested` adalah argumen fungsi (paling diutamakan); kalau None, dipakai
+    `config.OCR_ENGINE` (env var). Jadi pemanggil Python bisa menentukan engine per
+    dokumen tanpa mengubah environment:
+
+        DoclingParser().parse(pdf, ocr_engine="tesseract")
 
     Sebelumnya pemilihan engine dibungkus try/except tanpa nilai default: di macOS
     terpilih Apple Vision, di Linux exception-nya ditelan dan Docling diam-diam memakai
     engine lain. Hasil di laptop dan di server jadi berbeda tanpa ada yang tahu — persis
     jenis kesalahan yang baru ketahuan saat dokumen produksi salah terbaca.
 
-    Sekarang: `OCR_ENGINE=auto` (default) memilihkan yang terbaik untuk platform ini dan
-    mencatatnya di log; nilai eksplisit (`mac`, `easyocr`, `tesseract`, `rapidocr`)
-    GAGAL TERANG-TERANGAN kalau engine itu tidak tersedia, bukan diam-diam mundur.
+    Nilai eksplisit (`mac`, `easyocr`, `tesseract`, `rapidocr`) GAGAL TERANG-TERANGAN
+    kalau engine itu tidak tersedia, bukan diam-diam mundur. `auto` memilihkan yang
+    terbaik untuk platform ini dan mencatatnya di log.
     """
     import sys
 
-    requested = (config.OCR_ENGINE or "auto").strip().lower()
+    requested = (requested or config.OCR_ENGINE or "auto").strip().lower()
 
     def _load(key: str):
         class_name, kwargs, _desc = _OCR_ENGINES[key]
@@ -197,10 +203,14 @@ def _block_to_markdown(block_type: str, text: str) -> str:
 
 class DoclingParser:
     def __init__(self) -> None:
-        self._converters: Dict[bool, object] = {}
+        # Kunci cache memuat engine OCR juga: satu proses bisa memproses dokumen dengan
+        # engine berbeda (mis. benchmark), dan converter untuk engine A tidak boleh
+        # dipakai ulang untuk engine B.
+        self._converters: Dict[tuple, object] = {}
 
-    def _get_converter(self, do_ocr: bool):
-        if do_ocr not in self._converters:
+    def _get_converter(self, do_ocr: bool, ocr_engine: Optional[str] = None):
+        cache_key = (do_ocr, (ocr_engine or config.OCR_ENGINE or "auto").strip().lower())
+        if cache_key not in self._converters:
             from docling.datamodel.base_models import InputFormat
             from docling.datamodel.pipeline_options import PdfPipelineOptions
             from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -219,14 +229,14 @@ class DoclingParser:
                 logger.info(f"ℹ️ AcceleratorOptions tidak tersedia, memakai default Docling: {e}")
             if do_ocr:
                 options.images_scale = 2.0  # Tingkatkan DPI render citra untuk OCR agar teks halus/miring terbaca
-                engine = _resolve_ocr_engine()
+                engine = _resolve_ocr_engine(ocr_engine)
                 if engine.options is not None:
                     options.ocr_options = engine.options
-            self._converters[do_ocr] = DocumentConverter(
+            self._converters[cache_key] = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
             )
             logger.info(f"📄 Docling converter dimuat (OCR: {do_ocr}, Table Structure: True, Scale: {2.0 if do_ocr else 1.0})")
-        return self._converters[do_ocr]
+        return self._converters[cache_key]
 
     @staticmethod
     def _get_page_dimensions(doc, page_no: int) -> tuple:
@@ -252,9 +262,11 @@ class DoclingParser:
         ys = sorted(round(max(0.0, min(1.0, v / page_h)), 5) for v in (t, b))
         return BoundingBox(xmin=xs[0], ymin=ys[0], xmax=xs[1], ymax=ys[1])
 
-    def parse(self, pdf_path: str, do_ocr: bool = True, max_pages: int = None) -> LandingAIParsedResponse:
+    def parse(self, pdf_path: str, do_ocr: bool = True, max_pages: int = None,
+              ocr_engine: Optional[str] = None) -> LandingAIParsedResponse:
+        """`ocr_engine`: mac | rapidocr | tesseract | easyocr | auto. None = pakai config."""
         start_time = time.time()
-        converter = self._get_converter(do_ocr)
+        converter = self._get_converter(do_ocr, ocr_engine)
         kwargs = {"page_range": (1, max_pages)} if max_pages else {}
         doc = converter.convert(pdf_path, **kwargs).document
 

@@ -38,16 +38,7 @@ class LayoutRegion:
     norm_ymin: float = 0.0
     norm_xmax: float = 0.0
     norm_ymax: float = 0.0
-    
-    @property
-    def y_center(self) -> float:
-        """Y center for reading order sorting."""
-        return (self.bbox[1] + self.bbox[3]) / 2
-    
-    @property
-    def x_center(self) -> float:
-        """X center for column detection."""
-        return (self.bbox[0] + self.bbox[2]) / 2
+
 
 
 class LayoutParser:

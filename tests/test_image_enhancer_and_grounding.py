@@ -12,12 +12,10 @@ from app.parsers.image_enhancer import (
     sharpen_and_denoise,
     preprocess_image_for_ocr
 )
-from app.services.grounding_linker import (
-    calculate_match_confidence,
-    _validate_and_order_box,
-    find_best_bounding_box,
-    link_visual_groundings
-)
+# calculate_match_confidence dipakai langsung dari rumah aslinya. Dulu di-import lewat
+# app.services.grounding_linker -- shim kompatibilitas yang sudah dihapus karena pipeline
+# memakai app.evidence.locator/matcher secara langsung.
+from app.evidence.matcher import calculate_match_confidence
 from app.schemas.common import (
     BoundingBox,
     LandingAIParsedResponse,
@@ -146,60 +144,3 @@ def test_calculate_match_confidence_semantic_tokens():
     )
     assert match_type in ["phrase_containment", "semantic_token_match"]
     assert score >= 0.75
-
-
-def test_validate_and_order_box():
-    # Test inverted box (ymin > ymax)
-    inverted_box = BoundingBox(xmin=0.85, ymin=0.96, xmax=0.92, ymax=0.90)
-    valid_box = _validate_and_order_box(inverted_box)
-    
-    assert valid_box.xmin <= valid_box.xmax
-    assert valid_box.ymin <= valid_box.ymax
-    assert valid_box.ymin == 0.90
-    assert valid_box.ymax == 0.96
-
-
-def test_find_best_bounding_box_and_linking():
-    parsed_res = LandingAIParsedResponse(
-        markdown="# SPH\nPT Contoh\nNomor: 1241/00/BIS",
-        metadata=ParseMetadata(
-            job_id="test-job", page_count=1, output_markdown_chars=50, duration_ms=100
-        ),
-        structure=DocumentStructure(
-            children=[
-                StructureItem(
-                    type="page",
-                    grounding=Grounding(page=1, range=TextRange(start=0, end=50), box=BoundingBox(xmin=0, ymin=0, xmax=1, ymax=1)),
-                    children=[
-                        StructureItem(
-                            type="header",
-                            text="PT Contoh Solusi Teknologi",
-                            grounding=Grounding(page=1, range=TextRange(start=0, end=25), box=BoundingBox(xmin=0.1, ymin=0.1, xmax=0.5, ymax=0.15), confidence=0.96)
-                        ),
-                        StructureItem(
-                            type="paragraph",
-                            text="Nomor: 1241/00/BIS-05/BUT/2025",
-                            grounding=Grounding(page=1, range=TextRange(start=26, end=50), box=BoundingBox(xmin=0.1, ymin=0.2, xmax=0.6, ymax=0.25), confidence=0.95)
-                        )
-                    ]
-                )
-            ]
-        )
-    )
-
-    data = {
-        "Vendor": {"Nama Vendor": "PT Contoh Solusi Teknologi"},
-        "Nomor SPH": "1241/00/BIS-05/BUT/2025",
-        "NonExistentField": "String yang tidak ada di dokumen sama sekali"
-    }
-
-    linked = link_visual_groundings(data, parsed_res)
-    assert "Vendor.Nama Vendor" in linked
-    assert linked["Vendor.Nama Vendor"].confidence >= 0.90
-    assert linked["Vendor.Nama Vendor"].box.ymin < linked["Vendor.Nama Vendor"].box.ymax
-    
-    assert "Nomor SPH" in linked
-    assert linked["Nomor SPH"].confidence >= 0.90
-    
-    # Non existent field should be rejected and not produce noise
-    assert "NonExistentField" not in linked

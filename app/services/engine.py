@@ -92,7 +92,23 @@ class OpenADEEngine:
             return None
 
     def parse(self, pdf_path: str, max_pages: int = None, parser: Optional[str] = None,
-              profile: Optional[DocumentProfile] = None) -> LandingAIParsedResponse:
+              profile: Optional[DocumentProfile] = None,
+              ocr: Optional[str] = None) -> LandingAIParsedResponse:
+        """
+        `ocr` adalah SATU tombol pemilihan mesin OCR, dipakai sebagai argumen Python biasa:
+
+            engine.parse(pdf, ocr="rapidocr")   # default, lintas platform
+            engine.parse(pdf, ocr="mac")        # Apple Vision, hanya macOS
+            engine.parse(pdf, ocr="tesseract")  # Tesseract CLI
+            engine.parse(pdf, ocr="easyocr")    # engine bawaan Docling
+            engine.parse(pdf, ocr="paddle")     # PaddleOCR (jalur parser terpisah)
+
+        Empat nilai pertama berjalan di atas Docling (layout + TableFormer tetap dipakai);
+        "paddle" memakai jalur PP-Structure tersendiri. Sebelumnya pilihan ini terpecah di
+        dua knob (`parser=` dan env `OCR_ENGINE`) yang saling tumpang tindih -- mis.
+        parser="docling" + OCR_ENGINE="mac" -- sehingga sulit ditebak mana yang menang.
+        `parser=` dipertahankan untuk pemanggil lama; `ocr=` yang diutamakan.
+        """
         path = Path(pdf_path)
         if not path.exists():
             raise ParsingError(f"File tidak ditemukan: {pdf_path}")
@@ -104,13 +120,19 @@ class OpenADEEngine:
         else:
             needs_ocr = path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
-        choice = (parser or config.DEFAULT_PARSER).lower()
+        # `ocr=` menang atas `parser=`. "paddle" memilih jalur parser terpisah; nilai lain
+        # (rapidocr/mac/tesseract/easyocr/auto) diteruskan ke Docling sebagai engine OCR-nya.
+        selected = (ocr or parser or config.OCR_ENGINE or config.DEFAULT_PARSER).lower()
+        choice = "paddle" if selected == "paddle" else ("auto" if selected == "auto" else "docling")
+        docling_ocr = None if selected in ("paddle", "docling", "auto") else selected
+
         started = time.time()
         if choice == "paddle":
             parsed = self.paddle_parser.parse(pdf_path, max_pages=max_pages)
         else:
             try:
-                parsed = self.docling_parser.parse(pdf_path, do_ocr=needs_ocr, max_pages=max_pages)
+                parsed = self.docling_parser.parse(pdf_path, do_ocr=needs_ocr, max_pages=max_pages,
+                                                   ocr_engine=docling_ocr)
             except Exception as e:
                 if not needs_ocr and choice == "auto":
                     raise ParsingError(f"Docling parsing gagal: {e}")
@@ -220,7 +242,9 @@ class OpenADEEngine:
 
     # ------------------------------------------------------------------ end-to-end
     def process_full(self, pdf_path: str, doc_type: str = "auto", output_dir: str = None,
-                     max_pages: int = None, parser: Optional[str] = None) -> Dict[str, Any]:
+                     max_pages: int = None, parser: Optional[str] = None,
+                     ocr: Optional[str] = None) -> Dict[str, Any]:
+        """`ocr`: rapidocr | mac | tesseract | easyocr | paddle | auto (lihat self.parse)."""
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         timings: Dict[str, float] = {}
         t0 = time.time()
@@ -237,7 +261,7 @@ class OpenADEEngine:
         timings["profile_s"] = round(time.time() - t, 2)
 
         t = time.time()
-        parsed = self.parse(pdf_path, max_pages=max_pages, parser=parser, profile=profile)
+        parsed = self.parse(pdf_path, max_pages=max_pages, parser=parser, profile=profile, ocr=ocr)
         timings["parse_s"] = round(time.time() - t, 2)
         parse_md_file = parsing_dir / f"{path.stem}.parse.md"
         parse_json_file = parsing_dir / f"{path.stem}.parse.json"
@@ -294,6 +318,9 @@ class OpenADEEngine:
             "quality_report": quality_report,
             "document_profile": profile.to_dict() if profile else None,
             "run_info": run_info,
+            # Ikut masuk payload NocoDB sebagai kolom LongText (lihat exporters/nocodb.py),
+            # supaya PM bisa membaca dokumennya saat mengonfirmasi field per field.
+            "markdown": parsed.markdown,
         }
         extract_json_file = extraction_dir / f"{path.stem}.extract.json"
         extract_json_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
