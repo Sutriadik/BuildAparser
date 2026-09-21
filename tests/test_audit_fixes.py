@@ -130,6 +130,36 @@ def test_tables_without_price_columns_are_not_items():
     assert extract_items_from_markdown_tables(md, doc_type="contract") == []
 
 
+def test_desc_column_found_even_when_no_column_merged_into_it():
+    """
+    Regresi ke bug nyata (ditemukan dari benchmark KL FULL SIGNED dengan RapidOCR):
+    tabel structure recognition RapidOCR kadang menggabungkan kolom "No." ke header
+    tetangganya jadi satu sel, mis. "Uraian Pekerjaan/ Layanan. No" -- tidak terjadi
+    dengan Apple Vision pada dokumen yang sama.
+
+    Sebelumnya kata "no" ada di exclude-list desc_col, sehingga header gabungan ini
+    ditolak PADAHAL jelas memuat kata kunci deskripsi ("pekerjaan", "layanan"), lalu
+    jatuh ke fallback posisi tetap `headers[1]` -- yang kebetulan kolom Jumlah. Field
+    'Deskripsi Item/Barang/Pekerjaan' pun terisi angka volume ("1") alih-alih nama
+    barangnya, dan LLM "menambal" Spesifikasi dengan nama barang yang seharusnya
+    ada di Deskripsi -- kolom-kolom hasil ekstraksi jadi tertukar.
+    """
+    headers = ["Uraian Pekerjaan/ Layanan. No", "Jumlah.", "Satuan.",
+               "Jangka Waktu Pembayaran (bulan).", "Harga Satuan.",
+               "Harga Satuan. MRC OTC", "Harga Total. MRC"]
+    cols = detect_item_columns(headers)
+    assert cols["desc"] == "Uraian Pekerjaan/ Layanan. No"
+
+    md = ("| Uraian Pekerjaan/ Layanan. No | Jumlah. | Satuan. | Jangka Waktu Pembayaran (bulan). "
+          "| Harga Satuan. | Harga Satuan. MRC OTC | Harga Total. MRC |\n"
+          "|---|---|---|---|---|---|---|\n"
+          "| 1 Penyediaan Fortigate 200f | 1 | Paket | 12 | | 20.790.000 | 249.480.000 |\n")
+    items = extract_items_from_markdown_tables(md, doc_type="contract")
+    assert items[0]["Deskripsi Item/Barang/Pekerjaan"] == "Penyediaan Fortigate 200f"
+    assert items[0]["Nomor Item"] == "1"
+    assert items[0]["Jumlah Harga"] == 249480000.0
+
+
 # ---------------------------------------------------------------- classifier
 def test_classifier_sph_mentioning_spk_stays_sph():
     doc_type, conf = DocumentClassifier().classify_fast_rule("SURAT PENAWARAN HARGA\nPerihal: sesuai SPK sebelumnya")

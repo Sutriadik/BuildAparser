@@ -185,7 +185,15 @@ TOTAL_KEYWORDS = ["total harga", "jumlah harga", "harga total", "total", "amount
 
 
 def detect_item_columns(headers: List[str]) -> Dict[str, Any]:
-    desc_col = _find_col(headers, DESC_KEYWORDS, _PRICE_WORDS + ["no"])
+    # "no" TIDAK dimasukkan ke exclude: tidak ada satu pun DESC_KEYWORDS yang bisa salah
+    # cocok dengan header murni "No."/"Nomor", jadi kata itu tidak pernah dibutuhkan untuk
+    # mencegah false-positive -- ia cuma jadi jebakan untuk header GABUNGAN. RapidOCR
+    # (berbeda dari Apple Vision) kadang menggabungkan kolom "No." ke header tetangganya
+    # jadi satu sel, mis. "Uraian Pekerjaan/ Layanan. No". Dulu exclude "no" menolak header
+    # gabungan itu meski jelas memuat kata kunci deskripsi ("pekerjaan", "layanan"), lalu
+    # jatuh ke fallback posisi tetap headers[1] -- yang kebetulan kolom Jumlah, sehingga
+    # 'Deskripsi' terisi angka volume ("1") alih-alih nama barangnya.
+    desc_col = _find_col(headers, DESC_KEYWORDS, _PRICE_WORDS)
     if not desc_col:
         desc_col = headers[1] if len(headers) > 1 else headers[0]
     return {
