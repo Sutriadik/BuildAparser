@@ -14,6 +14,7 @@ tersendiri, dan baris-baris berdekatan yang senada digabung + blok tanda tangan
 dideteksi via app.parsers.block_grouper (lihat modul itu untuk detail & alasan).
 """
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from app.config import config
@@ -74,6 +75,77 @@ def _classify_label(label: str, text_val: str) -> str:
     return mapped
 
 
+@dataclass
+class _OcrEngine:
+    name: str
+    options: object  # None = pakai default bawaan Docling
+
+
+# Peta OCR_ENGINE -> kelas options Docling. OcrMac hanya ada di macOS.
+_OCR_ENGINES = {
+    "mac": ("OcrMacOptions", "Apple Vision (hanya macOS)"),
+    "easyocr": ("EasyOcrOptions", "EasyOCR (lintas platform, butuh torch)"),
+    "tesseract": ("TesseractOcrOptions", "Tesseract (butuh paket sistem tesseract)"),
+    "rapidocr": ("RapidOcrOptions", "RapidOCR (ONNX, lintas platform)"),
+}
+
+
+def _resolve_ocr_engine() -> _OcrEngine:
+    """
+    Tentukan engine OCR secara EKSPLISIT, dan katakan dengan keras yang mana.
+
+    Sebelumnya pemilihan engine dibungkus try/except tanpa nilai default: di macOS
+    terpilih Apple Vision, di Linux exception-nya ditelan dan Docling diam-diam memakai
+    engine lain. Hasil di laptop dan di server jadi berbeda tanpa ada yang tahu — persis
+    jenis kesalahan yang baru ketahuan saat dokumen produksi salah terbaca.
+
+    Sekarang: `OCR_ENGINE=auto` (default) memilihkan yang terbaik untuk platform ini dan
+    mencatatnya di log; nilai eksplisit (`mac`, `easyocr`, `tesseract`, `rapidocr`)
+    GAGAL TERANG-TERANGAN kalau engine itu tidak tersedia, bukan diam-diam mundur.
+    """
+    import sys
+
+    requested = (config.OCR_ENGINE or "auto").strip().lower()
+
+    def _load(key: str):
+        class_name, _ = _OCR_ENGINES[key]
+        from docling.datamodel import pipeline_options as po
+        return getattr(po, class_name)()
+
+    if requested == "auto":
+        # macOS: Apple Vision jelas tercepat dan paling akurat di mesin ini.
+        if sys.platform == "darwin":
+            try:
+                engine = _OcrEngine("mac", _load("mac"))
+                logger.info("⚡ OCR: Apple Vision (OCR_ENGINE=auto di macOS)")
+                return engine
+            except Exception as e:
+                logger.warning(f"⚠️  Apple Vision tidak tersedia walau di macOS: {e}")
+        # Platform lain: serahkan ke default Docling, tapi katakan dengan jelas.
+        logger.warning(
+            f"⚠️  OCR: memakai engine DEFAULT Docling di platform '{sys.platform}'. "
+            "Hasil bisa berbeda dengan macOS. Set OCR_ENGINE secara eksplisit "
+            f"({'|'.join(_OCR_ENGINES)}) untuk produksi."
+        )
+        return _OcrEngine("docling-default", None)
+
+    if requested not in _OCR_ENGINES:
+        raise ValueError(
+            f"OCR_ENGINE='{requested}' tidak dikenal. Pilihan: auto|{'|'.join(_OCR_ENGINES)}"
+        )
+
+    try:
+        options = _load(requested)
+    except Exception as e:
+        # Sengaja dilempar, bukan di-fallback: diminta eksplisit berarti harus itu.
+        raise RuntimeError(
+            f"OCR_ENGINE='{requested}' ({_OCR_ENGINES[requested][1]}) diminta tapi tidak bisa "
+            f"dimuat di platform ini: {e}"
+        ) from e
+    logger.info(f"⚡ OCR: {_OCR_ENGINES[requested][1]} (OCR_ENGINE={requested})")
+    return _OcrEngine(requested, options)
+
+
 def _block_to_markdown(block_type: str, text: str) -> str:
     """
     Render satu blok sesuai tipenya yang sudah diklasifikasi (_classify_label).
@@ -125,14 +197,9 @@ class DoclingParser:
                 logger.info(f"ℹ️ AcceleratorOptions tidak tersedia, memakai default Docling: {e}")
             if do_ocr:
                 options.images_scale = 2.0  # Tingkatkan DPI render citra untuk OCR agar teks halus/miring terbaca
-                try:
-                    import sys
-                    if sys.platform == "darwin":
-                        from docling.datamodel.pipeline_options import OcrMacOptions
-                        options.ocr_options = OcrMacOptions()
-                        logger.info("⚡ Docling OCR: Mengaktifkan Apple Vision Neural Engine (Akurasi Tinggi & Cepat)")
-                except Exception as e:
-                    logger.info(f"ℹ️ Docling OCR fallback ke default engine: {e}")
+                engine = _resolve_ocr_engine()
+                if engine.options is not None:
+                    options.ocr_options = engine.options
             self._converters[do_ocr] = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
             )

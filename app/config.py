@@ -46,6 +46,11 @@ class AppConfig(BaseModel):
     # dipakai hanya sebagai fallback.
     DEFAULT_PARSER: str = os.getenv("DEFAULT_PARSER", "docling")
     PARSER_NUM_THREADS: int = _env_int("PARSER_NUM_THREADS", max(1, (os.cpu_count() or 4) - 2))
+    # auto | mac | easyocr | tesseract | rapidocr. "auto" memilih Apple Vision di macOS dan
+    # engine default Docling di platform lain (dengan peringatan). Di produksi Linux, SET
+    # NILAI EKSPLISIT -- nilai eksplisit gagal terang-terangan kalau engine tidak tersedia,
+    # sehingga hasil server tidak pernah diam-diam berbeda dari hasil laptop.
+    OCR_ENGINE: str = os.getenv("OCR_ENGINE", "auto")
     DEFAULT_DPI: int = 150
     OCR_LANG: str = os.getenv("OCR_LANG", "en")
     SCANNED_CHAR_THRESHOLD: int = 40          # rata-rata karakter/halaman di bawah ini = scan

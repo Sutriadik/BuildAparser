@@ -20,6 +20,8 @@ from pathlib import Path
 # satu kali saat modul di-import.
 SETUP = {
     "DEFAULT_PARSER": "docling",      # docling | paddle | auto
+    "OCR_ENGINE": "auto",             # auto | mac | easyocr | tesseract | rapidocr
+                                      # di server Linux, isi eksplisit (mis. "easyocr")
     "OLLAMA_MODEL": "qwen2.5:7b",
     "OLLAMA_NUM_CTX": "16384",        # samakan di seluruh pipeline, jangan diubah per tahap
     "OLLAMA_KEEP_ALIVE": "30m",       # model tetap di memori antar panggilan
