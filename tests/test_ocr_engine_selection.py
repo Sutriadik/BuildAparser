@@ -58,5 +58,23 @@ def test_engine_eksplisit_tidak_pernah_mundur_diam_diam(set_engine, monkeypatch)
 def test_semua_engine_terdaftar_punya_kelas_options_di_docling():
     """Nama kelas di _OCR_ENGINES harus benar-benar ada di Docling versi terpasang."""
     import docling.datamodel.pipeline_options as po
-    for key, (class_name, _desc) in dp._OCR_ENGINES.items():
+    for key, (class_name, _kwargs, _desc) in dp._OCR_ENGINES.items():
         assert hasattr(po, class_name), f"{key}: {class_name} tidak ada di Docling ini"
+
+
+def test_rapidocr_tidak_memakai_bahasa_chinese_default():
+    """
+    Regresi ke bug nyata: RapidOcrOptions() tanpa argumen default ke lang=["chinese"],
+    yang di Docling resolve ke model gabungan CJK+Latin yang sama dipakai untuk
+    lang=["en"] (diverifikasi byte-identical). Model itu memecah teks Latin murni jadi
+    potongan tak terbaca -- pada dokumen scan kontrak, satu pasal terbaca
+    "e ean eaan ean an ea" alih-alih kalimat aslinya.
+
+    lang=["latin"] memuat model PP-OCRv5 khusus skrip Latin dan terbukti (benchmark
+    end-to-end) menurunkan rasio kata rusak dari 18,3% ke 4,7% pada dokumen yang sama.
+    Kalau tes ini gagal, seseorang mengembalikan RapidOCR ke default bahasa yang salah.
+    """
+    _class_name, kwargs, _desc = dp._OCR_ENGINES["rapidocr"]
+    assert kwargs.get("lang") == ["latin"], (
+        "RapidOCR harus eksplisit lang=['latin'], bukan default library (['chinese'])"
+    )

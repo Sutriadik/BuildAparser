@@ -81,12 +81,34 @@ class _OcrEngine:
     options: object  # None = pakai default bawaan Docling
 
 
-# Peta OCR_ENGINE -> kelas options Docling. OcrMac hanya ada di macOS.
+# Peta OCR_ENGINE -> (kelas options Docling, argumen, keterangan). OcrMac hanya ada di macOS.
+# Dokumen kita berbahasa Indonesia dengan istilah Inggris (invoice, delivery, license), jadi
+# Tesseract diberi dua bahasa sekaligus; tanpa "ind" kata berimbuhan banyak yang salah baca.
+_TESSERACT_LANG = ["ind", "eng"]
 _OCR_ENGINES = {
-    "mac": ("OcrMacOptions", "Apple Vision (hanya macOS)"),
-    "easyocr": ("EasyOcrOptions", "EasyOCR (lintas platform, butuh torch)"),
-    "tesseract": ("TesseractOcrOptions", "Tesseract (butuh paket sistem tesseract)"),
-    "rapidocr": ("RapidOcrOptions", "RapidOCR (ONNX, lintas platform)"),
+    "mac": ("OcrMacOptions", {}, "Apple Vision (hanya macOS)"),
+    "easyocr": ("EasyOcrOptions", {}, "EasyOCR (lintas platform, butuh torch)"),
+    # Varian CLI memanggil biner `tesseract` langsung, jadi tidak perlu kompilasi tesserocr.
+    "tesseract": ("TesseractCliOcrOptions", {"lang": _TESSERACT_LANG}, "Tesseract CLI (butuh biner tesseract)"),
+    "tesserocr": ("TesseractOcrOptions", {"lang": _TESSERACT_LANG}, "Tesseract via tesserocr (butuh kompilasi)"),
+    # BUG yang ditemukan lewat benchmark (bukan tebakan): RapidOcrOptions default ke
+    # lang=["chinese"], yang di Docling ternyata resolve ke PP-OCRv6 -- model gabungan
+    # CJK+Latin yang sama persis dipakai untuk lang=["en"] (diverifikasi: keduanya
+    # menghasilkan output BYTE-IDENTICAL). Model itu buruk untuk teks Latin murni --
+    # pada dokumen scan kontrak, satu pasal terbaca "e ean eaan ean an ea" alih-alih
+    # "BUT menjamin bahwa...". lang=["latin"] memuat model PP-OCRv5 khusus skrip Latin
+    # dan menurunkan rasio kata rusak dari 18,3% ke 4,7% pada dokumen KL FULL SIGNED penuh
+    # (setara Apple Vision 3,9%) -- kalimat "berjalan dengan baik...tanggal 02 Januari 2025"
+    # yang tadinya hilang total kini terbaca utuh. Angka 12,9->8,0 dari sampel 3 halaman awal
+    # tidak dipakai lagi, dokumen penuh menunjukkan perbaikan jauh lebih besar.
+    #
+    # Catatan jujur: hasil di atas dari 2 dokumen, dan RapidOCR hanya menerbitkan
+    # model Latin ukuran "mobile" -- tidak ada varian "server" yang lebih besar untuk
+    # dicoba (diverifikasi: model_type=SERVER ditolak, "Invalid OCR configuration", dan
+    # satu-satunya file .onnx latin yang ada bernama "_mobile"). Itu plafon kualitas
+    # RapidOCR untuk skrip Latin saat ini -- kebetulan sudah dekat Apple Vision pada
+    # sampel ini, tapi jangan dianggap terjamin sama pada dokumen lain.
+    "rapidocr": ("RapidOcrOptions", {"lang": ["latin"]}, "RapidOCR (ONNX, lintas platform)"),
 }
 
 
@@ -108,9 +130,9 @@ def _resolve_ocr_engine() -> _OcrEngine:
     requested = (config.OCR_ENGINE or "auto").strip().lower()
 
     def _load(key: str):
-        class_name, _ = _OCR_ENGINES[key]
+        class_name, kwargs, _desc = _OCR_ENGINES[key]
         from docling.datamodel import pipeline_options as po
-        return getattr(po, class_name)()
+        return getattr(po, class_name)(**kwargs)
 
     if requested == "auto":
         # macOS: Apple Vision jelas tercepat dan paling akurat di mesin ini.
@@ -139,10 +161,10 @@ def _resolve_ocr_engine() -> _OcrEngine:
     except Exception as e:
         # Sengaja dilempar, bukan di-fallback: diminta eksplisit berarti harus itu.
         raise RuntimeError(
-            f"OCR_ENGINE='{requested}' ({_OCR_ENGINES[requested][1]}) diminta tapi tidak bisa "
+            f"OCR_ENGINE='{requested}' ({_OCR_ENGINES[requested][2]}) diminta tapi tidak bisa "
             f"dimuat di platform ini: {e}"
         ) from e
-    logger.info(f"⚡ OCR: {_OCR_ENGINES[requested][1]} (OCR_ENGINE={requested})")
+    logger.info(f"⚡ OCR: {_OCR_ENGINES[requested][2]} (OCR_ENGINE={requested})")
     return _OcrEngine(requested, options)
 
 
