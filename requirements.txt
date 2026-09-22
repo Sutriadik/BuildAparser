@@ -3,10 +3,26 @@ docling>=2.0.0
 pymupdf>=1.24.0
 pillow>=10.0.0
 
-# OCR fallback engine (dimuat lazy; ~600MB bersama paddlepaddle + paddlex).
-# Pertimbangkan dipisah ke requirements-ocr.txt setelah benchmark Docling OCR vs Paddle (Plan Phase 7).
+# --- Mesin OCR -------------------------------------------------------------
+# Sebelumnya HANYA paddle yang tercantum di sini, padahal default aplikasi adalah
+# RapidOCR (app/config.py: OCR_ENGINE="rapidocr"). Akibatnya instalasi bersih dari
+# berkas ini tidak punya mesin OCR default-nya sama sekali -- baru ketahuan saat
+# menyiapkan image Docker, bukan saat dipakai.
+rapidocr-onnxruntime>=1.4.0      # default; ONNX, CPU, lintas platform
+easyocr>=1.7.0                   # OCR bawaan Docling; menarik torch (~2GB)
+
+# Apple Vision: macOS saja. Penanda platform dipasang supaya `pip install` di
+# Linux/Windows tidak gagal gara-gara paket yang memang tidak ada di sana.
+ocrmac>=1.0.0; sys_platform == "darwin"
+
+# PaddleOCR. CATATAN untuk mesin ber-GPU NVIDIA: ganti `paddlepaddle` di bawah
+# dengan `paddlepaddle-gpu` versi yang cocok dengan CUDA Anda (lihat
+# docs/UJI_WINDOWS_DOCKER.md). Wheel CPU dan GPU tidak boleh terpasang bersamaan.
 paddleocr>=2.7.0,<3.0
 paddlepaddle>=2.5.0
+
+# Tesseract TIDAK ada paketnya di sini: yang dipakai biner `tesseract` sistem
+# (Docling memanggilnya lewat CLI). Di Debian/Ubuntu: tesseract-ocr tesseract-ocr-ind.
 
 # Schema & AI Extraction Layer
 pydantic>=2.9.0

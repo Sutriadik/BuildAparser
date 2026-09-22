@@ -1,0 +1,58 @@
+# Open ADE — menguji mesin OCR di Linux / Windows(WSL2).
+#
+# Dua service, sengaja dipisah dan tidak jalan bersamaan:
+#
+#   docker compose run --rm ocr-cpu            # cek mesin apa saja yang hidup
+#   docker compose run --rm ocr-gpu            # sama, tapi image ber-CUDA
+#
+# Jalankan salah satu saja saat mengukur waktu. Dua container yang berebut CPU membuat
+# angka "Waktu Proses Rata-rata" tidak ada artinya.
+
+services:
+  ocr-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openade:cpu
+    volumes:
+      # Dokumen uji & hasil: dipetakan supaya keluarannya bisa dibaca dari host dan
+      # dibandingkan langsung dengan hasil di Mac.
+      - ./sample_pdfs:/app/sample_pdfs:ro
+      - ./storage/outputs:/app/storage/outputs
+      - ./eval:/app/eval
+      # Model OCR (ratusan MB) disimpan di volume, bukan di dalam image: kalau ikut
+      # image, tiap rebuild mengunduhnya lagi.
+      - ocr-models:/models
+    environment:
+      OCR_ENGINE: rapidocr
+      LOG_LEVEL: INFO
+
+  ocr-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Ganti dengan versi CUDA yang cocok dengan driver NVIDIA Anda. Nilai di bawah
+        # contoh; yang mengikat adalah halaman instalasi resmi PaddlePaddle.
+        BASE_IMAGE: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+        PADDLE_PKG: paddlepaddle-gpu
+        PADDLE_INDEX: https://www.paddlepaddle.org.cn/packages/stable/cu126/
+    image: openade:gpu
+    volumes:
+      - ./sample_pdfs:/app/sample_pdfs:ro
+      - ./storage/outputs:/app/storage/outputs
+      - ./eval:/app/eval
+      - ocr-models:/models
+    environment:
+      OCR_ENGINE: rapidocr
+      LOG_LEVEL: INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ocr-models:
