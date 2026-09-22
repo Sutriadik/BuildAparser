@@ -181,22 +181,9 @@ Yang paling penting dari berkas itu:
 
 ### A2. Pindahkan repo ke laptop Windows
 
-Repo ini **belum punya remote git**, dan `sample_pdfs/` (140 MB kontrak asli
-bertanda tangan) **ikut terlacak git**. Jadi jangan asal `git push` ke GitHub publik —
-dokumen klien akan ikut terbit.
-
-Cara paling aman untuk sekadar uji coba, lewat flashdisk/hardisk:
-
-```bash
-cd ~/Downloads
-tar --exclude='.venv311' --exclude='__pycache__' \
-    -czf buildAParser.tar.gz buildAParser
-```
-
-`.venv311` (2,6 GB) sengaja dibuang — di Windows/Linux virtualenv-nya harus dibuat
-ulang, isinya wheel macOS-ARM yang tidak berguna di sana. Sisanya sekitar 250 MB.
-
-Kalau tetap ingin lewat git, pakai **repositori privat**, dan sadari kontraknya ikut.
+Kode lewat git (repo privat GitHub), data klien lewat `buildAParser-data.zip` di luar
+git. Langkah lengkapnya ada di [JALANKAN_DI_WINDOWS.md](JALANKAN_DI_WINDOWS.md) — di
+Docker/WSL2, ganti `C:\dev\buildAParser` di sana dengan `~/buildAParser` di dalam WSL.
 
 ## Bagian B — di laptop Windows (Lenovo LOQ)
 
@@ -239,8 +226,9 @@ menghasilkan angka CPU, dan Anda akan salah menyimpulkan "ternyata GPU tidak mem
 ```bash
 wsl                       # masuk ke Ubuntu
 cd ~
-tar -xzf /mnt/c/Users/<nama-anda>/Downloads/buildAParser.tar.gz
+git clone https://github.com/Sutriadik/BuildAparser.git buildAParser
 cd buildAParser
+unzip /mnt/c/Users/<nama-anda>/Downloads/buildAParser-data.zip   # data klien
 ```
 
 Bind mount dari `C:\` menembus penerjemah filesystem Windows→Linux dan jauh lebih

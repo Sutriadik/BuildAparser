@@ -40,3 +40,19 @@ htmlcov/
 # Environment
 .env
 .env.local
+
+# Data klien -- JANGAN pernah masuk git (repo ada di GitHub).
+# Kontrak asli dan semua turunannya (teks OCR, hasil ekstraksi, golden set)
+# dipindahkan antar-mesin lewat buildAParser-data.zip, bukan lewat git.
+sample_pdfs/
+storage/outputs/
+storage/uploads/
+outputs/
+Hasil */
+eval/golden/
+eval/baseline_v1/
+eval/reports/
+eval/compare/
+notebooks/pdf_to_markdown_parser original.ipynb
+*.pdf
+*.docx
