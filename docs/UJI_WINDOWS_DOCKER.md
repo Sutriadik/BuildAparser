@@ -160,3 +160,145 @@ diuji dari macOS ARM. Jadi anggap keduanya titik awal yang masuk akal, bukan ses
 sudah terbukti jalan. Kesalahan yang paling mungkin muncul pada build pertama: nama paket
 sistem yang berbeda antar rilis Debian/Ubuntu, dan versi CUDA yang tidak cocok dengan
 driver. Keduanya ketahuan langsung saat build, bukan diam-diam.
+
+---
+
+# Daftar langkah: di Mac dulu, baru di Windows
+
+## Bagian A — di MacBook (sekali saja)
+
+### A1. Baseline sudah disimpan ✅
+
+`storage/outputs/bench/_hasil/_baseline_macos.json` berisi 15 kombinasi
+(5 mesin x 3 dokumen) lengkap dengan **sha1 teks OCR**. Ini pembanding wajibnya.
+Yang paling penting dari berkas itu:
+
+| Kombinasi | sha1 teks OCR | Karakter | Parse |
+|---|---|---|---|
+| `spk__paddle` | `299e7ee28b11` | 6.360 | 335,2s |
+| `kl__paddle` | `e936ff20e0a8` | 43.462 | 448,2s |
+| `np__paddle` | `ddba0d520804` | 6.118 | 396,0s |
+
+### A2. Pindahkan repo ke laptop Windows
+
+Repo ini **belum punya remote git**, dan `sample_pdfs/` (140 MB kontrak asli
+bertanda tangan) **ikut terlacak git**. Jadi jangan asal `git push` ke GitHub publik —
+dokumen klien akan ikut terbit.
+
+Cara paling aman untuk sekadar uji coba, lewat flashdisk/hardisk:
+
+```bash
+cd ~/Downloads
+tar --exclude='.venv311' --exclude='__pycache__' \
+    -czf buildAParser.tar.gz buildAParser
+```
+
+`.venv311` (2,6 GB) sengaja dibuang — di Windows/Linux virtualenv-nya harus dibuat
+ulang, isinya wheel macOS-ARM yang tidak berguna di sana. Sisanya sekitar 250 MB.
+
+Kalau tetap ingin lewat git, pakai **repositori privat**, dan sadari kontraknya ikut.
+
+## Bagian B — di laptop Windows (Lenovo LOQ)
+
+LOQ itu lini gaming, jadi kemungkinan besar ada RTX di dalamnya. Tapi **buktikan
+dulu**, jangan diasumsikan.
+
+### B1. Pastikan GPU-nya ada dan terbaca
+
+Buka PowerShell:
+
+```powershell
+nvidia-smi
+```
+
+Harus muncul tabel berisi nama GPU dan versi driver. Kalau `nvidia-smi` tidak
+dikenali, pasang dulu driver NVIDIA terbaru dari situs resmi (bukan lewat Windows
+Update). **Catat berapa VRAM-nya** — angka itu dipakai di langkah B6.
+
+### B2. Pasang WSL2 dan Docker Desktop
+
+```powershell
+wsl --install
+wsl --update
+```
+
+Lalu pasang Docker Desktop, dan di Settings pastikan **"Use the WSL 2 based engine"**
+aktif.
+
+### B3. Uji GPU tembus ke container — JANGAN dilewati
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
+```
+
+Kalau tabel GPU tidak muncul di sini, berhenti. Semua langkah setelah ini akan
+menghasilkan angka CPU, dan Anda akan salah menyimpulkan "ternyata GPU tidak membantu".
+
+### B4. Taruh repo di dalam WSL2, bukan di C:\
+
+```bash
+wsl                       # masuk ke Ubuntu
+cd ~
+tar -xzf /mnt/c/Users/<nama-anda>/Downloads/buildAParser.tar.gz
+cd buildAParser
+```
+
+Bind mount dari `C:\` menembus penerjemah filesystem Windows→Linux dan jauh lebih
+lambat — cukup untuk merusak pengukuran waktu yang justru sedang dicari.
+
+### B5. Build
+
+```bash
+docker compose build ocr-cpu        # pastikan jalan dulu
+docker compose build ocr-gpu        # sesuaikan versi CUDA di docker-compose.yml
+```
+
+### B6. Periksa CUDA benar-benar aktif
+
+```bash
+docker compose run --rm ocr-gpu python3 cek_ocr.py
+```
+
+Yang dicari satu baris ini:
+
+```
+✅ paddle    v3.x.x CUDA aktif — 1x NVIDIA GeForce RTX ...
+```
+
+Kalau muncul `wheel GPU terpasang TAPI tidak ada GPU terdeteksi`, passthrough-nya
+belum jalan — kembali ke B3.
+
+### B7. Ukur dan bandingkan
+
+```bash
+docker compose run --rm ocr-gpu python3 bench_ocr.py --consistency paddle --doc spk
+docker compose run --rm ocr-gpu python3 bench_ocr.py --consistency paddle --doc kl
+```
+
+Dua hal yang dibandingkan, dan yang kedua lebih penting:
+
+1. **Waktu** — Mac: SPK 335s, KL 448s. Target dengan GPU: di bawah 60s.
+2. **sha1** — Mac: SPK `299e7ee28b11`, KL `e936ff20e0a8`.
+   - **Sama** → teks OCR identik lintas platform; seluruh angka akurasi hasil
+     pengukuran di Mac tetap berlaku di Linux.
+   - **Beda** → angka akurasi Mac tidak otomatis berlaku, dan `skor_ocr.py` harus
+     dijalankan ulang di Windows. Ini temuan yang jauh lebih berarti daripada catatan waktu.
+
+### B8 (opsional tapi menarik) — uji seluruh pipeline, bukan cuma OCR
+
+Ini di luar pertanyaan awal, tapi sayang dilewatkan. Dari pengukuran di Mac,
+**OCR hanya 9–12% dari total waktu; sisanya LLM.** Artinya laptop ber-RTX berpotensi
+mempercepat seluruh pipeline jauh lebih banyak daripada sekadar mempercepat Paddle.
+
+Syaratnya model harus muat di VRAM: `qwen2.5:7b` kuantisasi Q4 butuh sekitar 4,7 GB.
+RTX dengan 6 GB ke atas muat; kalau hanya 4 GB, sebagian jatuh ke CPU dan justru
+bisa lebih lambat — karena itu VRAM-nya dicatat di langkah B1.
+
+```powershell
+# Ollama punya installer Windows dengan dukungan CUDA
+ollama pull qwen2.5:7b
+ollama run qwen2.5:7b "halo"      # cek kecepatannya
+```
+
+Kalau muat, jalankan `python bench_ocr.py --all` di sana dan bandingkan kolom
+`extract_s` dengan angka Mac (KL: 267,7s dengan RapidOCR).
