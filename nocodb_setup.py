@@ -29,8 +29,28 @@ import httpx
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from app.companion.model import ALL_TABLES  # noqa: E402
 from app.config import config  # noqa: E402
 from app.exporters.nocodb import _PRIMARY_KEYS  # noqa: E402
+
+# Dua model hidup berdampingan: exporter 13-tabel (kontrak & SPH) dan model companion
+# (BAST). Keduanya harus dikenali di sini, kalau tidak tabel companion tampil tanpa tanda
+# dan tidak ikut masuk ke NOCODB_TABLE_IDS -- push-nya lalu gagal dengan alasan yang
+# menyesatkan ("tabel belum dipetakan"), padahal tabelnya ada.
+_COMPANION_TABLES = {t.name for t in ALL_TABLES}
+
+
+def _kunci(nama: str) -> str:
+    """Label kunci upsert untuk ditampilkan. Model companion memakai kunci alami dari
+    model.py, bukan `document_id` seperti exporter lama."""
+    if nama in _COMPANION_TABLES:
+        from app.companion.model import table
+        from app.companion.nocodb_push import APPEND_ONLY, natural_key
+        if nama in APPEND_ONLY:
+            return "tambah-saja"
+        k = natural_key(table(nama))
+        return "+".join(k) if k else "ganti-anak"
+    return _PRIMARY_KEYS.get(nama, "document_id")
 
 
 def _headers() -> dict:
@@ -68,9 +88,14 @@ def cmd_list_tables() -> int:
                 tables.raise_for_status()
                 for t in tables.json().get("list", []):
                     title, tid = t.get("title"), t.get("id")
-                    dikenal = "✅" if title in _PRIMARY_KEYS else "  "
+                    if title in _COMPANION_TABLES:
+                        dikenal = "✅ companion"
+                    elif title in _PRIMARY_KEYS:
+                        dikenal = "✅ exporter  "
+                    else:
+                        dikenal = "            "
                     print(f"   {dikenal} {title:26} {tid}")
-                    if title in _PRIMARY_KEYS:
+                    if title in _COMPANION_TABLES or title in _PRIMARY_KEYS:
                         pairs.append(f"{title}:{tid}")
 
             if pairs:
@@ -78,8 +103,8 @@ def cmd_list_tables() -> int:
                 print(f'export NOCODB_TABLE_IDS="{",".join(pairs)}"')
             else:
                 print("\n⚠️  Belum ada tabel yang namanya cocok dengan payload kita.")
-                print("   Buat tabelnya sesuai storage/outputs/nocodb/_schema.json")
-                print("   (jalankan: python nocodb_export.py --schema)")
+                print("   BAST  : docs/SETUP_NOCODB_COMPANION.md")
+                print("   lainnya: python nocodb_export.py --schema")
     except httpx.HTTPError as e:
         print(f"❌ Gagal menghubungi NocoDB di {base_url}: {e}")
         return 1
@@ -118,7 +143,7 @@ def cmd_check() -> int:
                                headers=_headers(), params={"limit": 1})
                 r.raise_for_status()
                 jumlah = r.json().get("pageInfo", {}).get("totalRows", "?")
-                pk = _PRIMARY_KEYS.get(name, "document_id")
+                pk = _kunci(name)
                 print(f"  ✅ {name:26} {tid}  ({jumlah} baris, kunci: {pk})")
             except httpx.HTTPError as e:
                 print(f"  ❌ {name:26} {tid}  -> {e}")
